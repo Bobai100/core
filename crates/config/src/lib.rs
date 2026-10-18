@@ -1619,6 +1619,72 @@ pub struct AppConfig {
     /// continues from the saved cursor on the next cycle. Default: 10.
     #[serde(default)]
     pub max_pages_per_cycle: Option<usize>,
+    /// How `/readyz` combines per-contract health: `"all"` (default), `"any"`,
+    /// or a percentage of enabled contracts such as `"80%"`. A contract is
+    /// healthy when it polled successfully within 2 × its effective
+    /// `poll_interval_seconds`.
+    #[serde(default)]
+    pub readiness_policy: ReadinessPolicy,
+}
+
+/// Readiness policy for `/readyz`; see [`AppConfig::readiness_policy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(try_from = "String", into = "String")]
+#[schemars(with = "String")]
+pub enum ReadinessPolicy {
+    /// Every enabled contract must be healthy.
+    #[default]
+    All,
+    /// At least one enabled contract must be healthy.
+    Any,
+    /// At least this percentage (1–100) of enabled contracts must be healthy.
+    Percent(u8),
+}
+
+impl ReadinessPolicy {
+    /// Whether `healthy` out of `total` contracts satisfies the policy. No
+    /// contracts is never ready.
+    pub fn is_satisfied(self, healthy: usize, total: usize) -> bool {
+        if total == 0 {
+            return false;
+        }
+        match self {
+            ReadinessPolicy::All => healthy == total,
+            ReadinessPolicy::Any => healthy > 0,
+            ReadinessPolicy::Percent(p) => healthy * 100 >= total * usize::from(p),
+        }
+    }
+}
+
+impl TryFrom<String> for ReadinessPolicy {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        match value.trim() {
+            "all" => Ok(ReadinessPolicy::All),
+            "any" => Ok(ReadinessPolicy::Any),
+            other => other
+                .strip_suffix('%')
+                .and_then(|n| n.trim().parse::<u8>().ok())
+                .filter(|n| (1..=100).contains(n))
+                .map(ReadinessPolicy::Percent)
+                .ok_or_else(|| {
+                    format!(
+                        "readiness_policy must be \"all\", \"any\" or a percentage \"1%\"–\"100%\", got {value:?}"
+                    )
+                }),
+        }
+    }
+}
+
+impl From<ReadinessPolicy> for String {
+    fn from(policy: ReadinessPolicy) -> Self {
+        match policy {
+            ReadinessPolicy::All => "all".to_owned(),
+            ReadinessPolicy::Any => "any".to_owned(),
+            ReadinessPolicy::Percent(p) => format!("{p}%"),
+        }
+    }
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -2294,6 +2360,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -2329,6 +2396,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -2345,6 +2413,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -2437,6 +2506,7 @@ mod tests {
                 http_connection_verbose: None,
                 max_contracts: None,
                 max_pages_per_cycle: None,
+                readiness_policy: Default::default(),
                 cursor_file: None,
             };
             let err = cfg.validate().unwrap_err();
@@ -2475,6 +2545,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
         }
     }

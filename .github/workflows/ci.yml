@@ -102,6 +102,21 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── Rustdoc ─────────────────────────────────────────────────────────────────
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build docs with all rustdoc lints denied
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D rustdoc::all
+
   # ── Tests ───────────────────────────────────────────────────────────────────
   test:
     name: Tests

@@ -328,7 +328,7 @@ pub async fn run_with_reload(
 
     #[cfg(feature = "metrics")]
     {
-        metrics::set_poll_interval(cfg.poll_interval_seconds);
+        metrics::set_readiness_policy(cfg.readiness_policy);
         metrics::register_build_info();
     }
     let summary_every = Duration::from_secs(60);
@@ -430,6 +430,12 @@ pub async fn run_with_reload(
             }
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
+            #[cfg(feature = "metrics")]
+            metrics::register_contract(
+                &contract.label,
+                contract.network.as_str(),
+                interval.as_secs(),
+            );
             tasks.spawn(poll_contract_forever(
                 client.clone(),
                 contract.clone(),
@@ -489,7 +495,7 @@ pub async fn run_with_reload(
             .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
         {
-            metrics::set_poll_interval(new_cfg.poll_interval_seconds);
+            metrics::set_readiness_policy(new_cfg.readiness_policy);
             // Drop the series of contracts no longer polled under the same
             // label and network, or freshness alerts would fire for them forever.
             for old in cfg.contracts.iter().filter(|c| c.enabled) {
@@ -616,7 +622,7 @@ async fn poll_contract_forever(
                     metrics::inc_alerts(&contract.label, network, alerts);
                     metrics::inc_transactions_skipped(&contract.label, network, skipped);
                     metrics::record_poll_success(&contract.label, network);
-                    metrics::mark_poll_success();
+                    metrics::mark_poll_success(&contract.label, network, interval.as_secs());
                 }
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
@@ -2895,6 +2901,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
             contracts: vec![
                 WatchedContract {
@@ -2991,6 +2998,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
         }
     }
 
