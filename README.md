@@ -468,3 +468,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-41 -->
 - #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive
+
+<!-- handsoff-issue-290 -->
+- #290: `SorobanEventStreamer` "Stream" Mode Calls a Non-Existent Endpoint and Hangs
