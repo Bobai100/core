@@ -651,6 +651,159 @@ async fn high_fee_rule_fires_on_fee_charged() {
     .unwrap();
 }
 
+/// Issue #208: end-to-end coverage against a real `stellar/quickstart --local`
+/// node. Gated behind `TXWATCH_E2E_QUICKSTART=1` so it only runs in the CI job
+/// that starts the quickstart service container; skipped everywhere else.
+///
+/// The test drives the real poller against the local Horizon at
+/// `http://localhost:8000`, using a pre-deployed sample contract, and asserts
+/// that `FunctionCalled`, `TransactionFailed` and `EventEmitted` alerts reach a
+/// local webhook receiver.
+mod e2e_quickstart {
+    use super::*;
+
+    const QUICKSTART_HORIZON: &str = "http://localhost:8000";
+
+    fn enabled() -> bool {
+        std::env::var("TXWATCH_E2E_QUICKSTART").as_deref() == Ok("1")
+    }
+
+    /// Contract id of the sample contract deployed by the CI job before the
+    /// test runs. The job exports it as `TXWATCH_E2E_CONTRACT_ID`.
+    fn sample_contract_id() -> String {
+        std::env::var("TXWATCH_E2E_CONTRACT_ID").expect(
+            "TXWATCH_E2E_CONTRACT_ID must be set to the deployed sample contract id \
+             when TXWATCH_E2E_QUICKSTART=1",
+        )
+    }
+
+    /// Wait until the local quickstart Horizon answers, so the test does not
+    /// race the service container's startup.
+    async fn wait_for_horizon(client: &Client) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok(resp) = client.get(QUICKSTART_HORIZON).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "quickstart Horizon at {} did not become ready",
+                QUICKSTART_HORIZON
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Collect webhook payloads until `expected` have arrived or the deadline
+    /// passes, returning everything received.
+    async fn collect_webhooks(
+        receiver: &MockServer,
+        expected: usize,
+        timeout: Duration,
+    ) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let requests = receiver.received_requests().await.unwrap_or_default();
+            if requests.len() >= expected || Instant::now() >= deadline {
+                return requests
+                    .iter()
+                    .filter_map(|r| serde_json::from_slice(&r.body).ok())
+                    .collect();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn rule_types(payloads: &[serde_json::Value]) -> Vec<String> {
+        payloads
+            .iter()
+            .filter_map(|p| p["rule_type"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Real-Horizon end-to-end: deploy/invoke the sample contract, then assert
+    /// the poller delivers `FunctionCalled`, `TransactionFailed` and
+    /// `EventEmitted` alerts to a local receiver.
+    #[tokio::test]
+    async fn quickstart_delivers_function_failed_and_event_alerts() {
+        if !enabled() {
+            eprintln!(
+                "skipping quickstart e2e test; set TXWATCH_E2E_QUICKSTART=1 to run it"
+            );
+            return;
+        }
+
+        let client = txwatch_notifier::build_client().unwrap();
+        wait_for_horizon(&client).await;
+
+        let contract_id = sample_contract_id();
+        let receiver = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&receiver)
+            .await;
+
+        let mut contract = helpers::contract(
+            &format!("{}/hook", receiver.uri()),
+            vec![
+                AlertRule::FunctionCalled {
+                    function_name: "hello".into(),
+                    match_mode: Default::default(),
+                },
+                AlertRule::TransactionFailed,
+                AlertRule::EventEmitted {
+                    event_name: "transfer".into(),
+                    match_mode: Default::default(),
+                },
+            ],
+        );
+        contract.contract_id = contract_id;
+        contract.horizon_base_url_override = Some(QUICKSTART_HORIZON.to_string());
+
+        let cfg = AppConfig {
+            poll_interval_seconds: 1,
+            contracts: vec![contract],
+            cursor_file: None,
+            http_pool_max_idle_per_host: 10,
+            http_tcp_keepalive_secs: 30,
+            http_connection_verbose: None,
+            max_contracts: None,
+            max_pages_per_cycle: None,
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(txwatch_poller::run_with_shutdown(cfg, false, shutdown_rx));
+
+        // The CI job has already invoked the sample contract (successful call,
+        // a failing call and an event-emitting call) before starting the
+        // poller, so all three alerts should arrive within the window.
+        let payloads = collect_webhooks(&receiver, 3, Duration::from_secs(60)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+
+        let types = rule_types(&payloads);
+        assert!(
+            types.iter().any(|t| t.contains("FunctionCalled")),
+            "expected a FunctionCalled alert, got: {:?}",
+            types
+        );
+        assert!(
+            types.iter().any(|t| t.contains("TransactionFailed")),
+            "expected a TransactionFailed alert, got: {:?}",
+            types
+        );
+        assert!(
+            types.iter().any(|t| t.contains("EventEmitted")),
+            "expected an EventEmitted alert, got: {:?}",
+            types
+        );
+    }
+}
+
 /// When run in dry-run mode, matched rules are logged but webhooks are not sent.
 #[tokio::test]
 async fn run_polls_once_and_skips_webhook_in_dry_run() {
