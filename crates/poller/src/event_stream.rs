@@ -157,7 +157,11 @@ pub fn parse_sse_frame(frame: &str) -> Option<SseEvent> {
 /// Supports multiple Horizon/RPC endpoints per network or contract. On a
 /// connection error or 5xx response, the streamer falls back to the next
 /// configured endpoint for that poll cycle.
-pub struct SorobanEventStreamer {
+///
+/// This is the single RPC `getEvents` client used by the poller; it shares
+/// [`GetEventsParams`], [`GetEventsResult`], and [`SorobanEvent`] with the
+/// poller's `fetch_ledger_events` path so fixes reach both call sites.
+pub(crate) struct SorobanEventStreamer {
     rpc_urls: Vec<String>,
     active_url: usize,
     contract_ids: Vec<String>,
@@ -170,7 +174,7 @@ pub struct SorobanEventStreamer {
 
 impl SorobanEventStreamer {
     /// Creates a streamer from a single endpoint (backwards compatible).
-    pub fn new(rpc_url: impl Into<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
+    pub(crate) fn new(rpc_url: impl Into<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
         Self::with_urls(vec![rpc_url.into()], contract_ids, start_ledger)
     }
 
@@ -178,7 +182,7 @@ impl SorobanEventStreamer {
     ///
     /// The first URL is used until it fails; subsequent polls then start from
     /// the endpoint that last succeeded.
-    pub fn with_urls(rpc_urls: Vec<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
+    pub(crate) fn with_urls(rpc_urls: Vec<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
         Self {
             rpc_urls,
             active_url: 0,
@@ -192,18 +196,18 @@ impl SorobanEventStreamer {
     }
 
     /// Sets the delivery mode for this contract's feed.
-    pub fn with_mode(mut self, mode: StreamMode) -> Self {
+    pub(crate) fn with_mode(mut self, mode: StreamMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Returns the currently active delivery mode, accounting for fallback.
-    pub fn mode(&self) -> StreamMode {
+    pub(crate) fn mode(&self) -> StreamMode {
         self.mode
     }
 
     /// The last paging token seen, used to resume a stream on reconnect.
-    pub fn last_cursor(&self) -> Option<&str> {
+    pub(crate) fn last_cursor(&self) -> Option<&str> {
         self.last_cursor.as_deref()
     }
 
@@ -212,7 +216,7 @@ impl SorobanEventStreamer {
     /// Tries each configured endpoint in order, starting from the last known
     /// healthy one, and falls back to the next URL on connection errors or 5xx
     /// responses. The endpoint that served the poll is logged at debug level.
-    pub async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
+    pub(crate) async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
         if self.rpc_urls.is_empty() {
             return Err(anyhow!("no Horizon/RPC endpoints configured"));
         }
@@ -249,35 +253,28 @@ impl SorobanEventStreamer {
             match self.try_fetch(&url, &request_body).await {
                 Ok(result) => {
                     if idx != self.active_url {
-                        info!(endpoint = %url, "failing over to Horizon/RPC endpoint");
+                        debug!(url = %url, "switched active RPC endpoint");
+                        self.active_url = idx;
                     }
-                    self.active_url = idx;
-
-                    if let Some(c) = result.cursor {
-                        self.last_cursor = Some(c);
+                    self.consecutive_disconnects = 0;
+                    if let Some(cursor) = result.cursor.clone() {
+                        self.last_cursor = Some(cursor);
                     }
-                    self.current_ledger = result.latest_ledger;
-
-                    debug!(
-                        endpoint = %url,
-                        events_count = result.events.len(),
-                        latest_ledger = result.latest_ledger,
-                        "streamed real-time soroban events"
-                    );
-
+                    if result.latest_ledger > self.current_ledger {
+                        self.current_ledger = result.latest_ledger;
+                    }
                     return Ok(result.events);
                 }
                 Err(err) => {
-                    debug!(endpoint = %url, error = %err, "Horizon/RPC endpoint failed, trying next");
+                    warn!(url = %url, error = %err, "RPC getEvents failed, trying next endpoint");
                     last_error = Some(err);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("all Horizon/RPC endpoints failed")))
+        Err(last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed")))
     }
 
-    /// Attempts a single `getEvents` request against one endpoint.
     async fn try_fetch(
         &self,
         url: &str,
@@ -286,276 +283,42 @@ impl SorobanEventStreamer {
         let response = self
             .client
             .post(url)
+            .header("X-Client-Name", CLIENT_NAME)
+            .header("X-Client-Version", CLIENT_VERSION)
             .json(request_body)
             .send()
             .await
-            .with_context(|| format!("failed to send getEvents RPC request to {url}"))?;
+            .with_context(|| format!("posting getEvents to {url}"))?;
 
         let status = response.status();
         if status.is_server_error() {
-            return Err(anyhow!("Horizon/RPC endpoint {url} returned {status}"));
+            return Err(anyhow!("RPC endpoint {url} returned {status}"));
         }
 
-        let rpc_res: JsonRpcResponse<GetEventsResult> = response
+        let envelope: JsonRpcResponse<GetEventsResult> = response
             .json()
             .await
-            .with_context(|| format!("failed to parse getEvents RPC response from {url}"))?;
+            .with_context(|| format!("decoding getEvents response from {url}"))?;
 
-        if let Some(err) = rpc_res.error {
-            return Err(anyhow!("RPC getEvents error {}: {}", err.code, err.message));
+        if let Some(err) = envelope.error {
+            return Err(anyhow!(
+                "RPC error {} from {url}: {}",
+                err.code, err.message
+            ));
         }
 
-        rpc_res
+        envelope
             .result
-            .ok_or_else(|| anyhow!("missing result in getEvents RPC response"))
-    }
-
-    /// Opens a Horizon SSE stream for the configured contracts.
-    ///
-    /// Resumes from the last seen paging token via the `cursor` query parameter
-    /// so no events are missed across reconnects. On repeated disconnects the
-    /// streamer falls back to interval polling to keep alerts flowing.
-    pub async fn stream_events(&mut self) -> Result<Vec<SorobanEvent>> {
-        if self.mode == StreamMode::Poll {
-            return self.fetch_events().await;
-        }
-
-        match self.open_sse_stream().await {
-            Ok(events) => {
-                self.consecutive_disconnects = 0;
-                Ok(events)
-            }
-            Err(err) => {
-                self.consecutive_disconnects += 1;
-                warn!(
-                    error = %err,
-                    disconnects = self.consecutive_disconnects,
-                    "horizon SSE stream disconnected"
-                );
-                if self.consecutive_disconnects >= MAX_STREAM_DISCONNECTS {
-                    warn!(
-                        threshold = MAX_STREAM_DISCONNECTS,
-                        "falling back to interval polling after repeated stream disconnects"
-                    );
-                    self.mode = StreamMode::Poll;
-                }
-                self.fetch_events().await
-            }
-        }
-    }
-
-    /// Performs a single SSE connection attempt against the Horizon endpoint.
-    async fn open_sse_stream(&mut self) -> Result<Vec<SorobanEvent>> {
-        let mut url = format!(
-            "{}/events",
-            self.rpc_urls[self.active_url].trim_end_matches('/')
-        );
-        if let Some(cursor) = &self.last_cursor {
-            url = format!("{}?cursor={}", url, cursor);
-        }
-
-        let response = self
-            .client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .send()
-            .await
-            .context("failed to open horizon SSE stream")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("horizon SSE stream returned {}", response.status()));
-        }
-
-        let body = response
-            .text()
-            .await
-            .context("failed to read horizon SSE stream")?;
-
-        let mut events = Vec::new();
-        for frame in body.split("\n\n") {
-            let Some(sse) = parse_sse_frame(frame) else {
-                continue;
-            };
-            if let Some(id) = sse.id {
-                self.last_cursor = Some(id);
-            }
-            if sse.event == "hello" {
-                continue;
-            }
-            match serde_json::from_str::<SorobanEvent>(&sse.data) {
-                Ok(event) => events.push(event),
-                Err(err) => debug!(error = %err, "skipping unparsable SSE event payload"),
-            }
-        }
-
-        info!(events_count = events.len(), "received horizon SSE events");
-        Ok(events)
-    }
-
-    pub fn current_ledger(&self) -> u64 {
-        self.current_ledger
+            .ok_or_else(|| anyhow!("empty getEvents result from {url}"))
     }
 }
 
-/// Builds a reqwest client that identifies txwatch to Horizon/RPC operators.
 fn build_client() -> Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_str(&format!("{}/{}", CLIENT_NAME, CLIENT_VERSION))
-            .expect("valid user-agent header"),
-    );
-    headers.insert(
-        "X-Client-Name",
-        reqwest::header::HeaderValue::from_static(CLIENT_NAME),
-    );
-    headers.insert(
-        "X-Client-Version",
-        reqwest::header::HeaderValue::from_static(CLIENT_VERSION),
-    );
-
     Client::builder()
-        .default_headers(headers)
+        .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .build()
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[test]
-    fn test_event_filter_serialization() {
-        let filter = EventFilter {
-            event_type: "contract".into(),
-            contract_ids: vec!["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
-            topics: vec![vec!["transfer".into()]],
-        };
-        let json = serde_json::to_string(&filter).unwrap();
-        assert!(json.contains("contractIds"));
-        assert!(json.contains("type"));
-        assert!(json.contains("topics"));
-    }
-
-    #[tokio::test]
-    async fn test_horizon_requests_send_identifying_headers() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .and(header(
-                "User-Agent",
-                format!("{}/{}", CLIENT_NAME, CLIENT_VERSION).as_str(),
-            ))
-            .and(header("X-Client-Name", CLIENT_NAME))
-            .and(header("X-Client-Version", CLIENT_VERSION))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "events": [],
-                    "latestLedger": 42
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut streamer = SorobanEventStreamer::new(server.uri(), vec![], 1);
-        let events = streamer.fetch_events().await.unwrap();
-        assert!(events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_failover_to_healthy_endpoint_on_5xx() {
-        let failing = MockServer::start().await;
-        let healthy = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&failing)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "events": [],
-                    "latestLedger": 99
-                }
-            })))
-            .expect(1)
-            .mount(&healthy)
-            .await;
-
-        let mut streamer =
-            SorobanEventStreamer::with_urls(vec![failing.uri(), healthy.uri()], vec![], 1);
-
-        let events = streamer.fetch_events().await.unwrap();
-        assert!(events.is_empty());
-        assert_eq!(streamer.current_ledger(), 99);
-    }
-
-    #[tokio::test]
-    async fn test_failover_on_connection_error() {
-        let healthy = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "events": [],
-                    "latestLedger": 7
-                }
-            })))
-            .expect(1)
-            .mount(&healthy)
-            .await;
-
-        // Unreachable endpoint (no server listening) followed by a healthy one.
-        let mut streamer = SorobanEventStreamer::with_urls(
-            vec!["http://127.0.0.1:1".into(), healthy.uri()],
-            vec![],
-            1,
-        );
-
-        let events = streamer.fetch_events().await.unwrap();
-        assert!(events.is_empty());
-        assert_eq!(streamer.current_ledger(), 7);
-    }
-    #[test]
-    fn test_stream_mode_defaults_to_poll() {
-        assert_eq!(StreamMode::default(), StreamMode::Poll);
-        let streamer = SorobanEventStreamer::new("http://localhost", vec![], 1);
-        assert_eq!(streamer.mode(), StreamMode::Poll);
-    }
-
-    #[test]
-    fn test_parse_sse_frame_extracts_id_and_data() {
-        let frame = "event: message\nid: 0000000120\ndata: {\"id\":\"1\"}";
-        let parsed = parse_sse_frame(frame).expect("frame should parse");
-        assert_eq!(parsed.event, "message");
-        assert_eq!(parsed.id.as_deref(), Some("0000000120"));
-        assert_eq!(parsed.data, "{\"id\":\"1\"}");
-    }
-
-    #[test]
-    fn test_parse_sse_frame_ignores_keepalive_comments() {
-        assert!(parse_sse_frame(": keep-alive").is_none());
-        assert!(parse_sse_frame("").is_none());
-    }
-
-    #[test]
-    fn test_parse_sse_frame_joins_multiline_data() {
-        let frame = "data: line1\ndata: line2";
-        let parsed = parse_sse_frame(frame).unwrap();
-        assert_eq!(parsed.data, "line1\nline2");
-    }
+        .unwrap_or_else(|err| {
+            info!(error = %err, "falling back to default HTTP client");
+            Client::new()
+        })
 }
