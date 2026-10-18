@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FunctionCalled` argument matching: `args = [{ index = 1, eq = "G…" }]` matches decoded invocation parameters (Address, Symbol, U32/I128, String `ScVal`s); matched argument values are included in the alert payload (#266).
+- `Rate { rule, count, window_seconds }` alert rule: fires when the wrapped rule matches more than `count` times within a sliding `window_seconds` window per contract, emitting one alert per breach with the observed count (#267).
+- `Memo { memo_type, equals | prefix }` alert rule: matches transaction memos by type and exact value or text prefix, with validation (#268).
 - `NoActivity { minutes }` alert rule: fires once when a contract goes quiet longer than the configured threshold, and again (with `resolved = true`) when activity resumes. Evaluated per poll cycle, not per transaction. Null transaction hash and synthetic Horizon/Explorer links are used for the alert payload (#62).
 - `EvalContext` struct replaces the five positional `&str` parameters of `evaluate()`, preventing argument-order bugs at compile time; `EvalContext::from_contract` derives all fields from a `WatchedContract` (#59).
 - `WarningSuppressor`: repeated rule evaluation errors for the same rule are logged on the first occurrence and every 100th recurrence thereafter, preventing log flooding from structurally broken rules (#60).
@@ -20,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `evaluate()` now accepts `&EvalContext` and an optional `&WarningSuppressor` instead of five positional string arguments and no suppressor (#59, #60).
 - `WatchedContract::collect_errors` and `AppConfig::validate` now collect all validation errors before returning instead of stopping at the first failure (#60).
 - Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
+
+### Removed
+
+- **Breaking:** `YieldCalculator` and `PoolYield` are no longer exported from `txwatch-rules`. The module returned hard-coded "live" testnet data, ignored `pool_id`, and performed I/O in a crate documented as pure; it had no callers. Use a dedicated crate for live yield queries (#269).
 
 
 - `X-TxWatch-Version` header on every webhook request

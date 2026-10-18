@@ -470,6 +470,7 @@ async fn function_called_rule_fires_on_exact_match() {
         vec![AlertRule::FunctionCalled {
             function_name: "withdraw".into(),
             match_mode: Default::default(),
+            args: vec![],
         }],
     );
 
@@ -538,6 +539,110 @@ async fn function_called_rule_fires_on_exact_match() {
             .unwrap();
         }
     }
+}
+
+/// FunctionCalled with an argument matcher fires only on the invocation whose
+/// decoded argument matches, and the matched argument values are included in
+/// the webhook payload. Closes #266.
+#[tokio::test]
+async fn function_called_rule_matches_on_argument() {
+    use txwatch_rules::{ArgMatcher, InvocationArg};
+
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&receiver)
+        .await;
+
+    let client = txwatch_notifier::build_client().unwrap();
+    let contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::FunctionCalled {
+            function_name: "transfer".into(),
+            match_mode: Default::default(),
+            args: vec![ArgMatcher {
+                index: 1,
+                eq: Some("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into()),
+                any: false,
+            }],
+        }],
+    );
+
+    let matching_to = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let other_to = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    let make_tx = |hash: &str, token: &str, to: &str| {
+        let mut tx = EnrichedTransaction::from_horizon(
+            txwatch_rules::HorizonTransaction {
+                hash: hash.into(),
+                created_at: "2024-06-01T10:00:00Z".into(),
+                successful: true,
+                paging_token: token.into(),
+                fee_charged: None,
+                source_account: None,
+                fee_account: None,
+                envelope_xdr: None,
+                result_xdr: None,
+                ledger: None,
+                ..Default::default()
+            },
+            vec!["transfer".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        tx.invocation_args = vec![
+            InvocationArg {
+                index: 0,
+                value: "1000".into(),
+            },
+            InvocationArg {
+                index: 1,
+                value: to.into(),
+            },
+        ];
+        tx
+    };
+
+    let txs = vec![
+        make_tx("arg_miss", "1", other_to),
+        make_tx("arg_hit", "2", matching_to),
+    ];
+
+    let mut fired = 0;
+    for tx in &txs {
+        let payloads = evaluate(
+            &EvalContext {
+                label: &contract.label,
+                contract_id: &contract.contract_id,
+                network: contract.network.as_str(),
+                horizon_base: "https://horizon-testnet.stellar.org",
+                explorer_base: Some("https://stellar.expert/explorer/testnet"),
+            },
+            &contract.rules,
+            tx,
+            None,
+        );
+        for p in &payloads {
+            fired += 1;
+            assert_eq!(p.function.as_deref(), Some("transfer"));
+            assert!(
+                p.args.iter().any(|a| a.index == 1 && a.value == matching_to),
+                "payload must carry the matched argument values"
+            );
+            txwatch_notifier::send_webhook_simple(
+                &client,
+                contract.webhook_url.as_deref().unwrap(),
+                p,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    assert_eq!(fired, 1, "only the matching invocation should fire");
 }
 
 /// Cursor advances so the same transaction is not processed twice.

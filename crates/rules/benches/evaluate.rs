@@ -40,6 +40,20 @@ fn rules() -> Vec<RuleEntry> {
     }]
 }
 
+fn rate_rules() -> Vec<RuleEntry> {
+    vec![RuleEntry {
+        enabled: true,
+        webhook_url: None,
+        webhook_secret: None,
+        severity: None,
+        rule: AlertRule::Rate {
+            rule: Box::new(AlertRule::AnyTransaction),
+            count: 10,
+            window_seconds: 300,
+        },
+    }]
+}
+
 fn bench_evaluate(c: &mut Criterion) {
     let ctx = EvalContext {
         label: "bench",
@@ -52,6 +66,10 @@ fn bench_evaluate(c: &mut Criterion) {
 
     c.bench_function("evaluate/any_transaction", |b| {
         b.iter(|| black_box(evaluate(&ctx, &black_box(rules()), &tx, None)));
+    });
+
+    c.bench_function("evaluate/rate_any_transaction", |b| {
+        b.iter(|| black_box(evaluate(&ctx, &black_box(rate_rules()), &tx, None)));
     });
 }
 

@@ -6,6 +6,20 @@
   "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   "explorer_link": "https://stellar.expert/explorer/testnet/tx/abc123deadbeef",
   "fee_charged_stroops": 50000,
+  "function_args": [
+    {
+      "index": 0,
+      "name": null,
+      "type": "Address",
+      "value": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+    },
+    {
+      "index": 1,
+      "name": null,
+      "type": "I128",
+      "value": "150000000000"
+    }
+  ],
   "function_name": "transfer",
   "function_names": [
     "transfer"
