@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::IsTerminal,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -101,8 +102,10 @@ enum Command {
         check_horizon: bool,
 
         /// Output format. `json` prints the parsed config (secrets redacted) or the
-        /// validation error as a single JSON object on stdout.
-        #[arg(long, value_enum, default_value = "text", conflicts_with_all = ["check_webhooks", "check_horizon"])]
+        /// validation error as a single JSON object on stdout. Webhook and Horizon
+        /// check results are included in the JSON output when the respective flags
+        /// are also passed.
+        #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
 
@@ -163,13 +166,26 @@ enum Command {
         #[arg(long)]
         contract_id: Option<String>,
 
-        /// Stellar network: mainnet, testnet or futurenet
+        /// Stellar network: mainnet, testnet, futurenet, or a custom horizon-url
         #[arg(long)]
         network: Option<String>,
+
+        /// Override the Horizon base URL for this contract (implies a custom network)
+        #[arg(long)]
+        horizon_url: Option<String>,
 
         /// URL that receives webhook alerts
         #[arg(long)]
         webhook_url: Option<String>,
+
+        /// Human-readable label for this contract (default: "My Contract")
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Alert rule preset to add; repeatable. Choices: any-transaction, failed,
+        /// admin, large-transfer=<xlm>, high-fee=<stroops>, function=<name>
+        #[arg(long = "rule", value_name = "PRESET")]
+        rules: Vec<String>,
 
         /// Where to write the config
         #[arg(long, default_value = "txwatch.toml")]
@@ -178,6 +194,10 @@ enum Command {
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+
+        /// Never prompt; fail immediately if a required value is missing
+        #[arg(long)]
+        non_interactive: bool,
     },
 
     /// Evaluate a contract's rules against one historical transaction
@@ -219,18 +239,116 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate {
             format: OutputFormat::Json,
-            ..
-        } => match AppConfig::from_file(&required_config(&cli.config)?) {
-            Ok(cfg) => println!(
-                "{}",
-                serde_json::to_string_pretty(&config_summary_json(&cfg))?
-            ),
-            Err(e) => {
-                let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
-                println!("{}", serde_json::to_string_pretty(&error)?);
-                std::process::exit(1);
+            check_webhooks,
+            check_horizon,
+        } => {
+            let cfg = match AppConfig::from_file(&required_config(&cli.config)?) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
+                    println!("{}", serde_json::to_string_pretty(&error)?);
+                    std::process::exit(1);
+                }
+            };
+            let mut summary = config_summary_json(&cfg);
+
+            // Optionally run webhook checks and embed results.
+            if check_webhooks {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .context("failed to build HTTP client")?;
+                let targets: Vec<(String, String)> = cfg
+                    .contracts
+                    .iter()
+                    .flat_map(|c| {
+                        c.destinations()
+                            .into_iter()
+                            .map(move |d| (c.label.clone(), d.url))
+                    })
+                    .collect();
+                let results = join_all(targets.into_iter().map(|(label, url)| {
+                    let client = &client;
+                    async move {
+                        let result = check_webhook_reachable(client, &url).await;
+                        (label, url, result)
+                    }
+                }))
+                .await;
+                let mut webhook_checks = Vec::new();
+                let mut any_failed = false;
+                for (label, url, result) in results {
+                    let (ok, status, error) = match result {
+                        Ok(s) => {
+                            let failed = s == "method not allowed";
+                            if failed {
+                                any_failed = true;
+                            }
+                            (true, s.to_owned(), None)
+                        }
+                        Err(e) => {
+                            any_failed = true;
+                            (false, "unreachable".to_owned(), Some(format!("{:#}", e)))
+                        }
+                    };
+                    let mut entry = serde_json::json!({
+                        "contract": label,
+                        "url": url,
+                        "ok": ok,
+                        "status": status,
+                    });
+                    if let Some(err) = error {
+                        entry["error"] = serde_json::Value::from(err);
+                    }
+                    webhook_checks.push(entry);
+                }
+                summary["webhook_checks"] = serde_json::Value::from(webhook_checks);
+                if any_failed {
+                    summary["valid"] = serde_json::Value::Bool(false);
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                    std::process::exit(1);
+                }
             }
-        },
+
+            // Optionally run Horizon checks and embed results.
+            if check_horizon {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .context("failed to build HTTP client")?;
+                let checks = join_all(
+                    cfg.contracts
+                        .iter()
+                        .map(|c| check_horizon_contract(&client, c)),
+                )
+                .await;
+                let mut any_failed = false;
+                let horizon_checks: Vec<serde_json::Value> = checks
+                    .into_iter()
+                    .map(|check| {
+                        if !check.reachable || !check.found {
+                            any_failed = true;
+                        }
+                        serde_json::json!({
+                            "network": check.network,
+                            "status": check.status,
+                            "latest_ledger": check.latest_ledger,
+                            "reachable": check.reachable,
+                            "found": check.found,
+                            "message": check.message,
+                        })
+                    })
+                    .collect();
+                summary["horizon_checks"] = serde_json::Value::from(horizon_checks);
+                if any_failed {
+                    summary["valid"] = serde_json::Value::Bool(false);
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                    std::process::exit(1);
+                }
+            }
+
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
 
         Command::Validate {
             check_webhooks,
@@ -435,30 +553,110 @@ async fn main() -> Result<()> {
         Command::Init {
             ref contract_id,
             ref network,
+            ref horizon_url,
             ref webhook_url,
+            ref label,
+            ref rules,
             ref output,
             force,
+            non_interactive,
         } => {
+            // #228: detect non-TTY stdin or explicit --non-interactive flag
+            let interactive = !non_interactive && std::io::stdin().is_terminal();
+
+            // If not interactive, collect all missing required fields upfront and fail.
+            if !interactive {
+                let mut missing: Vec<&str> = Vec::new();
+                if contract_id.is_none() {
+                    missing.push("--contract-id");
+                }
+                if webhook_url.is_none() {
+                    missing.push("--webhook-url");
+                }
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "stdin is not a terminal; the following required flags are missing: {}",
+                        missing.join(", ")
+                    );
+                }
+            }
+
+            // #229: Validate --network before prompting for anything else.
+            if let Some(n) = network.as_deref() {
+                if n != "mainnet"
+                    && n != "testnet"
+                    && n != "futurenet"
+                    && horizon_url.is_none()
+                {
+                    anyhow::bail!(
+                        "unknown network '{}'; use mainnet, testnet, futurenet, or pass --horizon-url for a custom network",
+                        n
+                    );
+                }
+            }
+
+            // #227: check file existence before any prompts
             if output.exists() && !force {
                 return Err(anyhow::anyhow!(
                     "'{}' already exists; pass --force to overwrite it",
                     output.display()
                 ));
             }
-            let contract_id = value_or_prompt(contract_id, "Contract ID (C...)")?;
+
+            let contract_id = if interactive {
+                value_or_prompt(contract_id, "Contract ID (C...)")?
+            } else {
+                contract_id.clone().unwrap()
+            };
+
             let network = match network {
                 Some(n) => n.clone(),
-                None => prompt("Network [testnet]")?
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "testnet".into()),
+                None => {
+                    if interactive {
+                        prompt("Network [testnet]")?
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "testnet".into())
+                    } else {
+                        "testnet".into()
+                    }
+                }
             };
-            let webhook_url = value_or_prompt(webhook_url, "Webhook URL")?;
 
-            let raw = render_init_config(&contract_id, &network, &webhook_url)?;
+            let webhook_url = if interactive {
+                value_or_prompt(webhook_url, "Webhook URL")?
+            } else {
+                webhook_url.clone().unwrap()
+            };
+
+            // #229: label and horizon_url
+            let label = match label {
+                Some(l) => l.clone(),
+                None => {
+                    if interactive {
+                        prompt("Contract label [My Contract]")?
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "My Contract".into())
+                    } else {
+                        "My Contract".into()
+                    }
+                }
+            };
+
+            let raw = render_init_config(
+                &contract_id,
+                &network,
+                horizon_url.as_deref(),
+                &webhook_url,
+                &label,
+                rules,
+            )?;
+
             // Validate with the config crate before touching the filesystem.
             AppConfig::parse(&raw, output).context("the generated config is not valid")?;
-            fs::write(output, raw)
-                .with_context(|| format!("failed to write '{}'", output.display()))?;
+
+            // #227: use create_new(true) to avoid TOCTOU race, unless --force
+            write_config_file(output, &raw, force)?;
+
             println!(
                 "Wrote {}. Check it with: txwatch --config {} validate",
                 output.display(),
@@ -631,6 +829,49 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+/// Write the config file atomically:
+///  - Without `--force`: use `create_new(true)` so a file created between the
+///    existence check and the write is never silently overwritten (TOCTOU fix, #227).
+///  - With `--force`: truncate and overwrite.
+/// On Unix the file is created with 0600 permissions since it may hold a
+/// webhook secret.
+fn write_config_file(path: &Path, content: &str, force: bool) -> Result<()> {
+    // Build the OpenOptions depending on mode.
+    let file = if force {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    } else {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
+    .with_context(|| {
+        if force {
+            format!("failed to open '{}' for writing", path.display())
+        } else {
+            format!(
+                "'{}' already exists; pass --force to overwrite it",
+                path.display()
+            )
+        }
+    })?;
+
+    // Set 0600 permissions on Unix before writing any content.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on '{}'", path.display()))?;
+    }
+
+    use std::io::Write;
+    let mut file = file;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write '{}'", path.display()))?;
+    Ok(())
+}
+
 /// Read one trimmed line from stdin after printing `label`; `None` on EOF.
 fn prompt(label: &str) -> Result<Option<String>> {
     use std::io::{BufRead, Write};
@@ -653,28 +894,111 @@ fn value_or_prompt(value: &Option<String>, label: &str) -> Result<String> {
     }
 }
 
-/// Starter config for `txwatch init`: one contract and an AnyTransaction rule.
-fn render_init_config(contract_id: &str, network: &str, webhook_url: &str) -> Result<String> {
+/// Starter config for `txwatch init`.
+///
+/// Supported rule presets (via `--rule`):
+///   any-transaction        → type = "AnyTransaction"
+///   failed                 → type = "TransactionFailed"
+///   admin                  → type = "AdminFunctionCalled" with common admin function names
+///   large-transfer=<xlm>   → type = "LargeTransfer" with threshold_xlm = <xlm>
+///   high-fee=<stroops>     → type = "HighFee" with threshold_stroops = <stroops>
+///   function=<name>        → type = "FunctionCalled" with function_name = <name>
+fn render_init_config(
+    contract_id: &str,
+    network: &str,
+    horizon_url: Option<&str>,
+    webhook_url: &str,
+    label: &str,
+    rule_presets: &[String],
+) -> Result<String> {
     // TOML basic strings share JSON's escaping, so serde_json quotes values safely.
     let quote = |s: &str| serde_json::to_string(s);
+
+    // Build rule TOML snippets from presets; default to AnyTransaction if none given.
+    let rule_toml = if rule_presets.is_empty() {
+        "  [[contracts.rules]]\n  type = \"AnyTransaction\"\n".to_owned()
+    } else {
+        let mut parts = String::new();
+        for preset in rule_presets {
+            let snippet = parse_rule_preset(preset)?;
+            parts.push_str(&snippet);
+        }
+        parts
+    };
+
+    // Optional horizon_url override line.
+    let horizon_line = match horizon_url {
+        Some(url) => format!("horizon_url = {}\n", quote(url)?),
+        None => String::new(),
+    };
+
     Ok(format!(
         r#"# Generated by `txwatch init`. See docs/configuration.md for every option.
 poll_interval_seconds = 10
 
 [[contracts]]
-label       = "My Contract"
+label       = {label}
 contract_id = {contract_id}
 network     = {network}
-webhook_url = {webhook_url}
+{horizon_line}webhook_url = {webhook_url}
 # webhook_secret = "${{TXWATCH_WEBHOOK_SECRET}}"   # optional: signs each webhook
 
-  [[contracts.rules]]
-  type = "AnyTransaction"
-"#,
+{rule_toml}"#,
+        label = quote(label)?,
         contract_id = quote(contract_id)?,
         network = quote(network)?,
+        horizon_line = horizon_line,
         webhook_url = quote(webhook_url)?,
+        rule_toml = rule_toml,
     ))
+}
+
+/// Convert a `--rule` preset string into TOML snippet(s).
+fn parse_rule_preset(preset: &str) -> Result<String> {
+    let quote = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
+    if preset.eq_ignore_ascii_case("any-transaction") {
+        Ok("  [[contracts.rules]]\n  type = \"AnyTransaction\"\n".to_owned())
+    } else if preset.eq_ignore_ascii_case("failed") {
+        Ok("  [[contracts.rules]]\n  type = \"TransactionFailed\"\n".to_owned())
+    } else if preset.eq_ignore_ascii_case("admin") {
+        Ok(concat!(
+            "  [[contracts.rules]]\n",
+            "  type           = \"AdminFunctionCalled\"\n",
+            "  function_names = [\"set_admin\", \"upgrade\", \"initialize\"]\n",
+        )
+        .to_owned())
+    } else if let Some(rest) = preset.strip_prefix("large-transfer=") {
+        let xlm: u64 = rest.parse().with_context(|| {
+            format!(
+                "invalid large-transfer preset '{}': expected large-transfer=<xlm>",
+                preset
+            )
+        })?;
+        Ok(format!(
+            "  [[contracts.rules]]\n  type          = \"LargeTransfer\"\n  threshold_xlm = {xlm}\n"
+        ))
+    } else if let Some(rest) = preset.strip_prefix("high-fee=") {
+        let stroops: u64 = rest.parse().with_context(|| {
+            format!(
+                "invalid high-fee preset '{}': expected high-fee=<stroops>",
+                preset
+            )
+        })?;
+        Ok(format!(
+            "  [[contracts.rules]]\n  type               = \"HighFee\"\n  threshold_stroops = {stroops}\n"
+        ))
+    } else if let Some(rest) = preset.strip_prefix("function=") {
+        Ok(format!(
+            "  [[contracts.rules]]\n  type          = \"FunctionCalled\"\n  function_name = {}\n",
+            quote(rest)
+        ))
+    } else {
+        anyhow::bail!(
+            "unknown rule preset '{}'; valid presets: any-transaction, failed, admin, \
+             large-transfer=<xlm>, high-fee=<stroops>, function=<name>",
+            preset
+        )
+    }
 }
 
 /// The config path from `--config`, `TXWATCH_CONFIG` or the `./txwatch.toml`
