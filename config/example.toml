@@ -1,6 +1,6 @@
 poll_interval_seconds = 10
 # Optional: how often the poller logs a periodic summary line, in seconds.
-# Set to 0 to disable the periodic summary entirely.
+# Set to 0 to disable the periodic summary entirely. Default: 60.
 # summary_interval_seconds = 60
 # Optional: maximum number of contracts polled concurrently in a single
 # `watch --once` run. Defaults to 10. Lower it if Horizon rate-limits you.
@@ -156,10 +156,16 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
   [[contracts.rules]]
   type = "TransactionFailed"
 
-  # SourceAccount rule: alert when called by anyone except the known admin
+  # SourceAccount rule: alert when the known admin calls (deny fires when the
+  # source IS in the list). To alert when anyone EXCEPT the admin calls, use a
+  # Not rule wrapping a SourceAccount with allow = [...] instead.
+  #
+  #   allow = [addr]  →  fires when the source IS in the list
+  #   deny  = [addr]  →  fires when the source IS in the list (same direction!)
+  #
+  # Both fire on a match; the difference is which direction "match" means for
+  # your use-case. Use Not + allow to express "alert on everyone except X".
   [[contracts.rules]]
-  type = "All"
-  [[contracts.rules.rules]]
   type  = "SourceAccount"
   deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
   severity = "warning"

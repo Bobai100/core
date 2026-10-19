@@ -2097,6 +2097,10 @@ fn default_http_tcp_keepalive_secs() -> u64 {
     DEFAULT_HTTP_TCP_KEEPALIVE_SECS
 }
 
+fn default_summary_interval_seconds() -> u64 {
+    60
+}
+
 fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
@@ -2246,6 +2250,8 @@ impl AppConfig {
             // Each entry of the `webhooks` array is a destination in its own right.
             for (j, destination) in contract.webhooks.iter_mut().enumerate() {
                 let field = |name: &str| format!("contracts[{}].webhooks[{}].{}", i, j, name);
+                // Interpolate the destination URL itself (e.g. Slack URLs with a token path).
+                resolve_field(&mut destination.url, &field("url"))?;
                 resolve_destination(
                     &mut destination.secret,
                     &mut destination.headers,
@@ -2275,6 +2281,38 @@ impl AppConfig {
                     })?);
                 }
             }
+            // Soroban RPC URL on the contract itself.
+            if let Some(rpc_url) = &mut contract.soroban_rpc_url {
+                resolve_field(rpc_url, &field("soroban_rpc_url"))?;
+            }
+            // Rule-level webhook_url / webhook_secret inside composite rules.
+            for (r, rule_cfg) in contract.rules.iter_mut().enumerate() {
+                match &mut rule_cfg.rule {
+                    AlertRule::All { rules } => {
+                        for (k, entry) in rules.iter_mut().enumerate() {
+                            resolve_rule_entry(
+                                entry,
+                                &format!("contracts[{}].rules[{}].rules[{}]", i, r, k),
+                            )?;
+                        }
+                    }
+                    AlertRule::Any { rules } => {
+                        for (k, entry) in rules.iter_mut().enumerate() {
+                            resolve_rule_entry(
+                                entry,
+                                &format!("contracts[{}].rules[{}].rules[{}]", i, r, k),
+                            )?;
+                        }
+                    }
+                    AlertRule::Not { rule } => {
+                        resolve_rule_entry(
+                            rule,
+                            &format!("contracts[{}].rules[{}].rule", i, r),
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
             if let Network::Custom(custom) = &mut contract.network {
                 resolve_field(&mut custom.horizon_url, &field("network.horizon_url"))?;
                 if let Some(explorer_url) = &mut custom.explorer_url {
@@ -2282,6 +2320,10 @@ impl AppConfig {
                 }
                 if let Some(passphrase) = &mut custom.passphrase {
                     resolve_field(passphrase, &field("network.passphrase"))?;
+                }
+                // Interpolate the Soroban RPC URL on custom networks.
+                if let Some(rpc_url) = &mut custom.rpc_url {
+                    resolve_field(rpc_url, &field("network.rpc_url"))?;
                 }
             }
         }

@@ -33,6 +33,7 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
 | `max_pages_per_cycle`         | usize           | no       | `10`    | Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Must be 1–1000. Pages are processed as they arrive; when the cap is hit a warning is logged and the next cycle continues from the saved cursor. |
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
+| `summary_interval_seconds`    | u64             | no       | `60`    | How often the poller logs a periodic summary line (seconds). Set to `0` to disable the periodic summary entirely. |
 
 Unknown top-level keys are rejected.
 
@@ -826,7 +827,10 @@ These fields may reference environment variables anywhere in the value, so secre
 such as webhook tokens stay out of the config file:
 
 - `webhook_url`, `webhook_secret`
-- custom network `horizon_url`, `explorer_url`, `passphrase`
+- `webhooks[].url`, `webhooks[].secret`
+- rule-level `webhook_url`, `webhook_secret` (inside `All`, `Any`, `Not` nested entries)
+- `soroban_rpc_url`
+- custom network `horizon_url`, `explorer_url`, `passphrase`, `rpc_url`
 - `cursor_file`
 
 | Syntax              | Result |

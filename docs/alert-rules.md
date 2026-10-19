@@ -169,7 +169,7 @@ function_name = "withdraw"
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "admin_"
-match         = "prefix"
+match_mode    = "prefix"
 
 # Glob match: fires on set_fee, set_admin, set_pause, …
 [[contracts.rules]]
