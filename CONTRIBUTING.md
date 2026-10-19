@@ -43,8 +43,15 @@ curl -X POST http://localhost:8080/webhook -H "Content-Type: application/json" -
 
 To watch a different contract or change alert rules:
 
-1. Edit `config/example.toml`
+1. Edit `config/docker-compose.toml` (this is the file mounted by `docker-compose.yml`)
 2. Restart the stack: `docker compose down && docker compose up`
+
+Alternatively, send a `SIGHUP` to the running container to reload the config
+without restarting the stack:
+
+```bash
+docker compose kill -s HUP txwatch
+```
 
 ### Stopping the stack
 
@@ -257,3 +264,38 @@ docs: document MyNewRule in alert-rules.md
 - [ ] New rule documented in `docs/alert-rules.md`
 - [ ] CONTRIBUTING.md updated if the contribution process changed
 - [ ] CHANGELOG.md entry added under [Unreleased] describing what changed
+
+## Branch protection and required CI checks
+
+`main` is protected. A pull request can only be merged once **all** of the
+following required status checks pass:
+
+- `fmt`
+- `clippy`
+- `test`
+- `msrv`
+- `deny`
+- `docker`
+
+Branch protection also requires branches to be **up to date with `main`**
+before merging, so rebase or merge `main` into your branch if it falls behind.
+
+Never merge a PR — your own or a bot's — while any required check is failing
+or still running.
+
+## Dependabot review/merge policy
+
+Dependabot PRs are subject to exactly the same rules as human PRs:
+
+- **Do not merge a Dependabot PR while any required CI check is failing.**
+  A red `fmt`, `clippy`, `test`, `msrv`, `deny`, or `docker` check blocks the
+  merge, even for a patch-level dependency bump.
+- **Branches must be up to date with `main` before merging.** If `main` has
+  moved on, ask Dependabot to rebase (`@dependabot rebase`) and wait for CI to
+  run again on the updated branch.
+- Branch protection on `main` enforces these required status checks, so the
+  merge button stays disabled until they are green — do not use admin
+  overrides to bypass them.
+- If a Dependabot PR cannot be made green (e.g. an upstream release breaks the
+  MSRV or a lint), close it and open a tracking issue instead of merging it.
+=======

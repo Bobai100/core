@@ -5,9 +5,12 @@
 //! - `txwatch_alerts_total{contract,network}`            — alert payloads sent (rules matched)
 //! - `txwatch_alerts_suppressed_total{contract,network,rule_type}` — rule matches dropped by a cooldown
 //! - `txwatch_transactions_skipped_total{contract,network}` — transactions dropped because they could not be enriched
+//! - `txwatch_transactions_degraded_total{contract,network}` — transactions evaluated without operation details (enrichment failed after retries)
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
 //! - `txwatch_event_fetch_failures_total{contract,reason}` — event fetches that failed or were unavailable
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
+//! - `txwatch_horizon_rate_limited_total{contract,network}` — Horizon 429 (rate limited) responses
+//! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
 //! - `txwatch_webhook_deliveries_total{contract,format,destination,outcome}` — webhook deliveries;
 //!   `destination` is the destination's index in the contract's list, never its URL
 //! - `txwatch_webhook_delivery_duration_seconds{format,outcome}` — webhook delivery latency (incl. retries)
@@ -77,6 +80,18 @@ fn transactions_skipped_total() -> &'static IntCounterVec {
     })
 }
 
+fn transactions_degraded_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_transactions_degraded_total",
+            "Total transactions evaluated without operation details because enrichment failed after retries, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_transactions_degraded_total")
+    })
+}
+
 fn alerts_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -113,6 +128,15 @@ fn webhook_failures_total() -> &'static IntCounterVec {
     })
 }
 
+fn horizon_rate_limited_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_horizon_rate_limited_total",
+            "Total Horizon HTTP 429 (rate limited) responses, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_horizon_rate_limited_total")
 fn event_fetch_failures_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -204,9 +228,12 @@ fn ledger_lag() -> &'static IntGaugeVec {
     })
 }
 
-/// Registers `txwatch_build_info{version,git_sha} 1`. `git_sha` comes from the
-/// `TXWATCH_GIT_SHA` environment variable at build time, if set.
-pub fn register_build_info() {
+/// Registers `txwatch_build_info{version,git_sha} 1`.
+///
+/// The build information is supplied by the caller (the CLI passes its own
+/// compile-time version and git SHA), so the labels reflect the binary that
+/// was actually built rather than this crate's compile-time environment.
+pub fn register_build_info(version: &str, git_sha: &str) {
     static G: OnceLock<IntGaugeVec> = OnceLock::new();
     G.get_or_init(|| {
         let gauge = register_int_gauge_vec!(
@@ -215,12 +242,7 @@ pub fn register_build_info() {
             &["version", "git_sha"]
         )
         .expect("register txwatch_build_info");
-        gauge
-            .with_label_values(&[
-                env!("CARGO_PKG_VERSION"),
-                option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown"),
-            ])
-            .set(1);
+        gauge.with_label_values(&[version, git_sha]).set(1);
         gauge
     });
 }
@@ -236,6 +258,14 @@ pub fn inc_transactions(contract: &str, network: &str, n: u64) {
 /// Calling it with `0` creates the series so it is exported before any skip.
 pub fn inc_transactions_skipped(contract: &str, network: &str, n: u64) {
     transactions_skipped_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
+}
+
+/// Increment `txwatch_transactions_degraded_total` for a contract by `n`.
+/// Calling it with `0` creates the series so it is exported before any degradation.
+pub fn inc_transactions_degraded(contract: &str, network: &str, n: u64) {
+    transactions_degraded_total()
         .with_label_values(&[contract, network])
         .inc_by(n);
 }
@@ -261,6 +291,10 @@ pub fn inc_webhook_failures(contract: &str, network: &str) {
         .inc();
 }
 
+/// Increment `txwatch_horizon_rate_limited_total` for a contract by 1.
+pub fn inc_horizon_rate_limited(contract: &str, network: &str) {
+    horizon_rate_limited_total()
+        .with_label_values(&[contract, network])
 /// Increment `txwatch_event_fetch_failures_total{contract,reason}` by 1.
 ///
 /// `reason` is a short, low-cardinality tag such as `"retention"` (the
