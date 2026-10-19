@@ -552,7 +552,6 @@ pub struct AlertPayload {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enrichment_incomplete: bool,
 }
-=======
 
 /// Deterministic alert ID: the first 32 hex characters (128 bits) of
 /// SHA-256 over `contract_id`, `transaction_hash` and `rule_triggered`.
@@ -2765,6 +2764,7 @@ mod no_activity_tests {
 #[allow(clippy::unwrap_used)]
 mod suppressor_tests {
     use super::*;
+    use txwatch_config::RuleEntry;
 
     #[test]
     fn first_warning_is_always_emitted() {
@@ -3211,6 +3211,105 @@ mod suppressor_tests {
             rule_label(&event_rule("transfer", &["*", "GTO"])),
             "EventEmitted(transfer, *, GTO)"
         );
+    }
+
+    // ── Issue #244: EventEmitted nested inside composite rules ─────────────────
+
+    #[test]
+    fn event_emitted_nested_in_composite_all_fires_when_both_match() {
+        let all_rule = AlertRule::All {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::FunctionCalled {
+                        function_name: "deposit".into(),
+                        match_mode: FunctionMatchMode::Exact,
+                    },
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: event_rule("transfer", &[]),
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        };
+
+        // Tx with both function and event: fires
+        let matching_tx = make_tx(true, &["deposit"], None).with_events(vec![transfer_event()]);
+        let payloads = run(std::slice::from_ref(&all_rule), &matching_tx);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "composite All with nested EventEmitted must fire when both match"
+        );
+        assert_eq!(payloads[0].matched_events.len(), 1);
+
+        // Tx with function only (no event): does not fire
+        let no_event_tx = make_tx(true, &["deposit"], None);
+        let payloads = run(std::slice::from_ref(&all_rule), &no_event_tx);
+        assert!(
+            payloads.is_empty(),
+            "composite All must not fire when nested EventEmitted has no events"
+        );
+
+        // Tx with event only (no matching function): does not fire
+        let no_fn_tx = make_tx(true, &["withdraw"], None).with_events(vec![transfer_event()]);
+        let payloads = run(&[all_rule], &no_fn_tx);
+        assert!(
+            payloads.is_empty(),
+            "composite All must not fire when function does not match"
+        );
+    }
+
+    #[test]
+    fn event_emitted_nested_in_composite_any_and_not() {
+        let any_rule = AlertRule::Any {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::TransactionFailed,
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: event_rule("transfer", &[]),
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        };
+
+        // Successful tx with transfer event fires Any
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        let payloads = run(&[any_rule], &tx);
+        assert_eq!(payloads.len(), 1);
+
+        let not_rule = AlertRule::Not {
+            rule: Box::new(RuleEntry {
+                rule: event_rule("transfer", &[]),
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }),
+        };
+
+        // Tx without transfer event fires Not
+        let no_event_tx = make_tx(true, &[], None);
+        let payloads = run(std::slice::from_ref(&not_rule), &no_event_tx);
+        assert_eq!(payloads.len(), 1);
+
+        // Tx with transfer event does not fire Not
+        let payloads = run(&[not_rule], &tx);
+        assert!(payloads.is_empty());
     }
 
     #[test]

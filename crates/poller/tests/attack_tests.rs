@@ -51,6 +51,7 @@ async fn test_attack_horizon_429_flood_backs_off() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Run poller with a timeout; it must safely handle the 429 without panicking

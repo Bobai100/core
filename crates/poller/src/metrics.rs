@@ -272,7 +272,9 @@ pub fn inc_transactions_degraded(contract: &str, network: &str, n: u64) {
 
 /// Increment `txwatch_alerts_total` for a contract by `n`.
 pub fn inc_alerts(contract: &str, network: &str, n: u64) {
-    alerts_total().with_label_values(&[contract, network]).inc();
+    alerts_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
 }
 
 /// Increment `txwatch_alerts_suppressed_total` for a contract's rule type by 1.

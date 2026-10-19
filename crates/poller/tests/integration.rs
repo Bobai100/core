@@ -75,6 +75,7 @@ async fn run_polls_once_and_fires_webhook() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -148,6 +149,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -195,6 +197,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -865,6 +868,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -932,6 +936,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -1011,6 +1016,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -1112,6 +1118,7 @@ async fn contracts_polled_concurrently() {
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
         cursor_file: None,
+        ..Default::default()
     };
 
     // `run` never returns, so time how long it takes until both webhooks arrive.
@@ -1200,15 +1207,15 @@ async fn slow_contract_does_not_block_fast_contract() {
 
     let make_contract =
         |label: &str, contract_id: &str, horizon: &MockServer, receiver: &MockServer| {
-        let mut contract = helpers::contract(
-            &format!("{}/hook", receiver.uri()),
-            vec![AlertRule::AnyTransaction],
-        );
-        contract.label = label.to_string();
-        contract.contract_id = contract_id.to_string();
-        contract.horizon_base_url_override = Some(horizon.uri());
-        contract
-    };
+            let mut contract = helpers::contract(
+                &format!("{}/hook", receiver.uri()),
+                vec![AlertRule::AnyTransaction],
+            );
+            contract.label = label.to_string();
+            contract.contract_id = contract_id.to_string();
+            contract.horizon_base_url_override = Some(horizon.uri());
+            contract
+        };
 
     let cfg = AppConfig {
         poll_interval_seconds: 30,
@@ -1233,21 +1240,19 @@ async fn slow_contract_does_not_block_fast_contract() {
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
         cursor_file: None,
+        ..Default::default()
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(txwatch_poller::run_with_shutdown(cfg, false, shutdown_rx));
-    let fast_delivered = tokio::time::timeout(
-        Duration::from_millis(FAST_DEADLINE_MS),
-        async {
-            loop {
-                if !fast_receiver.received_requests().await.unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    let fast_delivered = tokio::time::timeout(Duration::from_millis(FAST_DEADLINE_MS), async {
+        loop {
+            if !fast_receiver.received_requests().await.unwrap().is_empty() {
+                break;
             }
-        },
-    )
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
     .is_ok();
 
@@ -1311,6 +1316,7 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1403,6 +1409,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
@@ -1461,6 +1468,7 @@ async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let report = txwatch_poller::run_once(cfg, true)
@@ -1536,6 +1544,7 @@ async fn cursor_file_is_persisted_after_a_poll_cycle() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1852,6 +1861,7 @@ async fn transactions_request_includes_failed() {
         max_contracts: None,
         max_pages_per_cycle: None,
         readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Dry run: this asserts the request we send, not the delivery path.

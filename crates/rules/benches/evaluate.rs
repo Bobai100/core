@@ -2,7 +2,9 @@
 //! per transaction, so the per-call cost matters more than anything else in the
 //! rules crate.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use txwatch_config::{AlertRule, RuleEntry};
 use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext};
 

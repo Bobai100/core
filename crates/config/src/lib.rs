@@ -5,7 +5,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, fmt, fs, path::Path};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    env, fmt, fs,
+    path::{Path, PathBuf},
+};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -698,6 +703,12 @@ impl AlertRule {
                 rule.validate_at_depth(contract_label, depth + 1)?;
             }
             AlertRule::NoActivity { minutes } => {
+                if depth > 0 {
+                    bail!(
+                        "contract '{}': NoActivity rule cannot be nested inside composite rules",
+                        contract_label
+                    );
+                }
                 if *minutes == 0 {
                     bail!(
                         "contract '{}': NoActivity minutes must be > 0",
@@ -742,7 +753,14 @@ impl AlertRule {
     /// Used in CLI `validate` output and in the `rule_triggered` webhook field.
     /// True for rules that need the transaction's contract events (fetched from Soroban RPC).
     pub fn needs_events(&self) -> bool {
-        matches!(self, AlertRule::EventEmitted { .. })
+        match self {
+            AlertRule::EventEmitted { .. } => true,
+            AlertRule::All { rules } | AlertRule::Any { rules } => {
+                rules.iter().any(|r| r.rule.needs_events())
+            }
+            AlertRule::Not { rule } => rule.rule.needs_events(),
+            _ => false,
+        }
     }
 
     pub fn label(&self) -> String {
@@ -1645,7 +1663,7 @@ pub fn cursor_key(network: &Network, contract_id: &str) -> String {
     format!("{}:{}", network.cursor_id(), contract_id)
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Default polling interval in seconds for every contract (5–3600).
@@ -1657,6 +1675,7 @@ pub struct AppConfig {
     /// the `TXWATCH_POLL_JITTER_PERCENT` environment variable. Default: 10.
     #[serde(default = "default_poll_jitter_percent")]
     pub poll_jitter_percent: u64,
+    #[serde(default)]
     pub contracts: Vec<WatchedContract>,
     /// Optional path to a JSON file used to persist the cursor map across restarts.
     /// When set, the poller will load cursors from this file on startup and write
@@ -1695,6 +1714,38 @@ pub struct AppConfig {
     /// `poll_interval_seconds`.
     #[serde(default)]
     pub readiness_policy: ReadinessPolicy,
+    /// Optional list of glob patterns for files to include.
+    /// Loaded in deterministic order (sorted lexicographically).
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// All files that were read to build this configuration (root config + all included files).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub loaded_files: Vec<PathBuf>,
+    /// Map of lowercase contract label to the file where it was defined.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub contract_files: std::collections::HashMap<String, PathBuf>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
+            poll_jitter_percent: default_poll_jitter_percent(),
+            contracts: Vec::new(),
+            cursor_file: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
+            http_connection_verbose: None,
+            max_contracts: None,
+            max_pages_per_cycle: None,
+            include: Vec::new(),
+            loaded_files: Vec::new(),
+            contract_files: std::collections::HashMap::new(),
+            readiness_policy: ReadinessPolicy::default(),
+        }
+    }
 }
 
 /// Readiness policy for `/readyz`; see [`AppConfig::readiness_policy`].
@@ -1779,7 +1830,8 @@ where
 {
     // serde_path_to_error::deserialize owns the Track that Deserializer::new
     // otherwise requires, so the field path survives into the error message.
-    let deserializer = toml::Deserializer::new(raw);
+    let deserializer = toml::Deserializer::parse(raw)
+        .map_err(|error| anyhow!("{} (in {})", error, path.display()))?;
     serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let field_path = error.path().to_string();
         let inner = error.into_inner();
@@ -1890,6 +1942,15 @@ fn resolve_destination(
     Ok(())
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IncludedFile {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub contracts: Vec<WatchedContract>,
+}
+
 impl AppConfig {
     /// Expands `${VAR}` references in every string field that may carry a
     /// secret or a deployment-specific value.
@@ -1957,17 +2018,129 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        Self::parse(&raw, path)
+        Self::parse_internal(&raw, path)
     }
 
     /// Parse and validate TOML exactly as [`AppConfig::from_file`] does;
     /// `source` only labels error messages.
     pub fn parse(raw: &str, source: &Path) -> Result<Self> {
+        Self::parse_internal(raw, source)
+    }
+
+    fn parse_internal(raw: &str, source: &Path) -> Result<Self> {
         let mut cfg: AppConfig = deserialize_toml_with_field_context(raw, source)
             .with_context(|| format!("failed to parse config file '{}'", source.display()))?;
+
+        let mut visited = std::collections::HashSet::new();
+        let canon = source
+            .canonicalize()
+            .unwrap_or_else(|_| source.to_path_buf());
+        visited.insert(canon);
+        cfg.loaded_files.push(source.to_path_buf());
+
+        for c in &cfg.contracts {
+            cfg.contract_files
+                .insert(c.label.to_lowercase(), source.to_path_buf());
+        }
+
+        let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
+        cfg.resolve_includes(base_dir, &mut visited)?;
+
         cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn resolve_includes(
+        &mut self,
+        base_dir: &Path,
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> Result<()> {
+        if self.include.is_empty() {
+            return Ok(());
+        }
+
+        for pattern in &mut self.include {
+            resolve_field(pattern, "include")?;
+        }
+
+        let mut matched_files: Vec<PathBuf> = Vec::new();
+
+        for pattern in &self.include {
+            let full_pattern = if Path::new(pattern).is_absolute() {
+                PathBuf::from(pattern)
+            } else {
+                base_dir.join(pattern)
+            };
+            let pattern_str = full_pattern.to_string_lossy();
+            let is_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+
+            if is_glob {
+                let paths = glob::glob(&pattern_str)
+                    .map_err(|e| anyhow!("invalid include glob pattern '{}': {}", pattern, e))?;
+                for entry in paths {
+                    let p = entry.map_err(|e| anyhow!("error reading glob path: {}", e))?;
+                    if p.is_file() {
+                        matched_files.push(p);
+                    }
+                }
+            } else {
+                if !full_pattern.is_file() {
+                    bail!(
+                        "cannot read config file '{}' (included in '{}')",
+                        full_pattern.display(),
+                        base_dir.display()
+                    );
+                }
+                matched_files.push(full_pattern);
+            }
+        }
+
+        // Deterministic ordering: sort lexicographically
+        matched_files.sort();
+        matched_files.dedup();
+
+        for included_path in matched_files {
+            let canonical = included_path
+                .canonicalize()
+                .unwrap_or_else(|_| included_path.clone());
+            if !visited.insert(canonical) {
+                bail!("circular include detected: '{}'", included_path.display());
+            }
+
+            let raw = fs::read_to_string(&included_path).with_context(|| {
+                format!("cannot read config file '{}'", included_path.display())
+            })?;
+
+            let included: IncludedFile = deserialize_toml_with_field_context(&raw, &included_path)
+                .with_context(|| {
+                    format!("failed to parse config file '{}'", included_path.display())
+                })?;
+
+            self.loaded_files.push(included_path.clone());
+
+            for c in &included.contracts {
+                self.contract_files
+                    .insert(c.label.to_lowercase(), included_path.clone());
+            }
+
+            // Recursive include support
+            if !included.include.is_empty() {
+                let sub_base = included_path.parent().unwrap_or_else(|| Path::new("."));
+                let mut sub_cfg = AppConfig {
+                    include: included.include,
+                    ..Default::default()
+                };
+                sub_cfg.resolve_includes(sub_base, visited)?;
+                self.loaded_files.extend(sub_cfg.loaded_files);
+                self.contract_files.extend(sub_cfg.contract_files);
+                self.contracts.extend(sub_cfg.contracts);
+            }
+
+            self.contracts.extend(included.contracts);
+        }
+
+        Ok(())
     }
 
     /// The contract limit in force: `max_contracts`, else [`MAX_CONTRACTS`].
@@ -2026,7 +2199,14 @@ impl AppConfig {
         }
 
         for contract in &mut self.contracts {
-            errors.extend(contract.collect_errors());
+            let contract_errors = contract.collect_errors();
+            if let Some(file) = self.contract_files.get(&contract.label.to_lowercase()) {
+                for err in contract_errors {
+                    errors.push(format!("{} (in {})", err, file.display()));
+                }
+            } else {
+                errors.extend(contract_errors);
+            }
         }
 
         match self.max_contracts {
@@ -2057,8 +2237,16 @@ impl AppConfig {
         let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
             let key = contract.label.to_lowercase();
-            if !seen.insert(key) && reported.insert(contract.label.clone()) {
-                errors.push(format!("duplicate contract label '{}'", contract.label));
+            if !seen.insert(key.clone()) && reported.insert(contract.label.clone()) {
+                if let Some(file) = self.contract_files.get(&key) {
+                    errors.push(format!(
+                        "duplicate contract label '{}' (in {})",
+                        contract.label,
+                        file.display()
+                    ));
+                } else {
+                    errors.push(format!("duplicate contract label '{}'", contract.label));
+                }
             }
         }
 
@@ -2069,13 +2257,19 @@ impl AppConfig {
         for contract in &self.contracts {
             let key = contract.cursor_key();
             if let Some(first_label) = seen_keys.get(&key).cloned() {
+                let origin = self
+                    .contract_files
+                    .get(&contract.label.to_lowercase())
+                    .map(|p| format!(" (in {})", p.display()))
+                    .unwrap_or_default();
                 errors.push(format!(
                     "duplicate contract_id '{}' on network '{}' (labels '{}' and '{}'); each \
-                     (network, contract_id) pair can be watched only once",
+                     (network, contract_id) pair can be watched only once{}",
                     contract.contract_id,
                     contract.network.as_str(),
                     first_label,
-                    contract.label
+                    contract.label,
+                    origin
                 ));
             } else {
                 seen_keys.insert(key, contract.label.clone());
@@ -2084,6 +2278,74 @@ impl AppConfig {
 
         ValidationErrors::into_result(errors)
     }
+}
+
+/// Computes a composite SHA-256 hash representing the content of the config file
+/// and all included files (resolved via `include` globs).
+/// Used by file watchers to detect changes across multi-file configurations.
+pub fn compute_config_hash(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut visited = std::collections::HashSet::new();
+    hash_config_recursive(path, &mut hasher, &mut visited)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn hash_config_recursive(
+    path: &Path,
+    hasher: &mut Sha256,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
+
+    let content =
+        fs::read(path).with_context(|| format!("cannot read config file '{}'", path.display()))?;
+
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(&content);
+
+    #[derive(Deserialize, Default)]
+    struct ConfigIncludesOnly {
+        #[serde(default)]
+        include: Vec<String>,
+    }
+
+    if let Ok(cfg) =
+        toml::from_str::<ConfigIncludesOnly>(std::str::from_utf8(&content).unwrap_or_default())
+    {
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut matched_files: Vec<PathBuf> = Vec::new();
+        for pattern in cfg.include {
+            let full_pattern = if Path::new(&pattern).is_absolute() {
+                PathBuf::from(pattern)
+            } else {
+                base_dir.join(pattern)
+            };
+            let pattern_str = full_pattern.to_string_lossy();
+            let is_glob =
+                pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[');
+            if is_glob {
+                if let Ok(paths) = glob::glob(&pattern_str) {
+                    for entry in paths.flatten() {
+                        if entry.is_file() {
+                            matched_files.push(entry);
+                        }
+                    }
+                }
+            } else if full_pattern.is_file() {
+                matched_files.push(full_pattern);
+            }
+        }
+        matched_files.sort();
+        matched_files.dedup();
+        for file in matched_files {
+            let _ = hash_config_recursive(&file, hasher, visited);
+        }
+    }
+
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2441,6 +2703,7 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
         let errors = &err.downcast_ref::<ValidationErrors>().unwrap().0;
@@ -2477,6 +2740,7 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -2494,6 +2758,7 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2587,6 +2852,7 @@ mod tests {
                 max_pages_per_cycle: None,
                 readiness_policy: Default::default(),
                 cursor_file: None,
+                ..Default::default()
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -2626,7 +2892,7 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
-            concurrency: None,
+            ..Default::default()
         }
     }
 
@@ -4288,5 +4554,159 @@ mod tests {
         );
         assert!(err.contains("contracts[0].webhook_url"), "got: {}", err);
         assert!(err.contains("TXWATCH_TEST_MISSING"), "got: {}", err);
+    }
+
+    // ── Issue #244 & #245: Nested EventEmitted and NoActivity validation ───────
+
+    #[test]
+    fn rejects_no_activity_nested_in_all() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::All {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::FunctionCalled {
+                        function_name: "deposit".into(),
+                        match_mode: FunctionMatchMode::Exact,
+                    },
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: AlertRule::NoActivity { minutes: 10 },
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("NoActivity rule cannot be nested inside composite rules"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_no_activity_nested_in_any() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::Any {
+            rules: vec![RuleEntry {
+                rule: AlertRule::NoActivity { minutes: 5 },
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("NoActivity rule cannot be nested inside composite rules"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_no_activity_nested_in_not() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::Not {
+            rule: Box::new(RuleEntry {
+                rule: AlertRule::NoActivity { minutes: 5 },
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }),
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("NoActivity rule cannot be nested inside composite rules"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_no_activity_at_top_level() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::NoActivity { minutes: 15 })];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn needs_events_recurses_into_composite_rules() {
+        let event_rule = AlertRule::EventEmitted {
+            topic: "mint".into(),
+            topics: vec!["*".into()],
+        };
+        let not_event = AlertRule::Not {
+            rule: Box::new(RuleEntry {
+                rule: event_rule.clone(),
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }),
+        };
+        let all_event = AlertRule::All {
+            rules: vec![RuleEntry {
+                rule: not_event.clone(),
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }],
+        };
+        let any_event = AlertRule::Any {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::TransactionFailed,
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: event_rule,
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        };
+
+        assert!(not_event.needs_events());
+        assert!(all_event.needs_events());
+        assert!(any_event.needs_events());
+
+        let mut c = valid_contract();
+        c.rules = vec![rule(all_event)];
+        assert!(c.needs_events());
+    }
+
+    #[test]
+    fn validation_fails_when_nested_event_emitted_lacks_rpc_url() {
+        let mut c = valid_contract();
+        c.network = Network::Mainnet;
+        c.soroban_rpc_url = None;
+        c.rules = vec![rule(AlertRule::All {
+            rules: vec![RuleEntry {
+                rule: AlertRule::EventEmitted {
+                    topic: "mint".into(),
+                    topics: vec!["*".into()],
+                },
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("EventEmitted rules need a Soroban RPC endpoint"),
+            "got: {err}"
+        );
     }
 }

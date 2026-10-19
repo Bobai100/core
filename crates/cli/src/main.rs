@@ -105,6 +105,10 @@ enum Command {
         #[arg(long)]
         once: bool,
 
+        /// Reload configuration when the config file or included files change
+        #[arg(long, env = "TXWATCH_WATCH_CONFIG")]
+        watch_config: bool,
+
         /// Maximum number of contracts polled concurrently
         #[arg(long, default_value_t = 10)]
         concurrency: usize,
@@ -798,6 +802,7 @@ async fn main() -> Result<()> {
         Command::Watch {
             dry_run,
             once,
+            watch_config,
             concurrency,
             #[cfg(feature = "metrics")]
             metrics_addr,
@@ -847,7 +852,16 @@ async fn main() -> Result<()> {
             }
             // On Unix this installs a SIGHUP handler; on Windows it is a no-op.
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
-            spawn_reload_on_sighup(config_path, cli.horizon_url.clone(), reload_tx)?;
+            spawn_reload_on_sighup(
+                config_path.clone(),
+                cli.horizon_url.clone(),
+                reload_tx.clone(),
+            )?;
+
+            let watch_enabled = watch_config || cfg!(windows);
+            if watch_enabled {
+                spawn_config_watcher(config_path, reload_tx, cli.horizon_url.clone());
+            }
 
             info!(
                 version = VERSION,
@@ -1148,9 +1162,55 @@ fn spawn_reload_on_sighup(
     Ok(())
 }
 
-/// Re-read and validate the config file. Only used by the Unix SIGHUP handler,
-/// so it is dead code on other platforms.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// Watches the configuration file and any included files for changes.
+/// Debounces changes to prevent partial reads and correctly detects
+/// symlink swaps (common in Kubernetes ConfigMap volume mounts).
+fn spawn_config_watcher(
+    path: PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+    horizon_url: Option<String>,
+) {
+    tokio::spawn(async move {
+        let mut last_hash = txwatch_config::compute_config_hash(&path).ok();
+        let poll_interval = Duration::from_millis(250);
+        let debounce_interval = Duration::from_millis(250);
+
+        loop {
+            tokio::time::sleep(poll_interval).await;
+
+            let current_hash = match txwatch_config::compute_config_hash(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if last_hash.as_ref() == Some(&current_hash) {
+                continue;
+            }
+
+            // Debounce: wait until hash is stable across debounce_interval
+            tokio::time::sleep(debounce_interval).await;
+            let debounced_hash = match txwatch_config::compute_config_hash(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if debounced_hash != current_hash {
+                continue;
+            }
+
+            last_hash = Some(debounced_hash);
+            info!(path = %path.display(), "config file change detected — reloading config");
+
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
+                if reload_tx.send(cfg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Re-read and validate the config file.
 fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
         Ok(mut cfg) => {

@@ -1,7 +1,7 @@
 //! Attack tests for `txwatch-rules` verifying defenses against numeric overflow,
 //! symbol spoofing, and evasion attacks.
 
-use txwatch_config::{AlertRule, DataMatcher, RuleConfig, TopicMatcher};
+use txwatch_config::{AlertRule, DataMatcher, RuleConfig, RuleEntry, TopicMatcher};
 use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext, HorizonTransaction};
 
 fn dummy_tx(hash: &str, successful: bool, fee_charged: Option<&str>) -> HorizonTransaction {
@@ -364,9 +364,13 @@ fn test_attack_rule_level_webhook_secret_only_override() {
     let raw = dummy_tx("secret_only_tx", false, None);
     let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
 
-    let rules = vec![RuleConfig {
+    let rule_secret = "rule-level-signing-key";
+    let rules = vec![RuleEntry {
         rule: AlertRule::TransactionFailed,
-        cooldown_seconds: None,
+        webhook_url: None,
+        webhook_secret: Some(rule_secret.to_string()),
+        severity: None,
+        enabled: true,
     }];
     let ctx = EvalContext {
         label: "Escrow",
@@ -377,34 +381,16 @@ fn test_attack_rule_level_webhook_secret_only_override() {
     };
 
     let payloads = evaluate(&ctx, &rules, &enriched, None);
-    assert_eq!(payloads.len(), 1, "TransactionFailed must fire on failed tx");
+    assert_eq!(
+        payloads.len(),
+        1,
+        "TransactionFailed must fire on failed tx"
+    );
 
     let payload = &payloads[0];
-    let destinations = payload
-        .destinations()
-        .expect("payload must expose its destinations");
-    assert!(
-        !destinations.is_empty(),
-        "contract destinations must be present when no rule override is set"
-    );
-
-    // Apply a secret-only override and confirm every destination carries the
-    // rule-level secret instead of the contract-level one.
-    let rule_secret = "rule-level-signing-key";
-    let overridden = payload.with_webhook_secret_override(rule_secret);
-    let overridden_destinations = overridden
-        .destinations()
-        .expect("overridden payload must expose its destinations");
     assert_eq!(
-        overridden_destinations.len(),
-        destinations.len(),
-        "secret-only override must not change the destination set"
+        payload.effective_webhook_secret.as_deref(),
+        Some(rule_secret),
+        "rule-level webhook_secret must be applied to payload even without webhook_url"
     );
-    for dest in overridden_destinations {
-        assert_eq!(
-            dest.webhook_secret.as_deref(),
-            Some(rule_secret),
-            "rule-level webhook_secret must be applied to every destination"
-        );
-    }
 }
