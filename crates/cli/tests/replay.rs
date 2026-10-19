@@ -67,6 +67,15 @@ async fn horizon_with_admin_call() -> MockServer {
 }
 
 async fn replay(config: &Path, horizon: &MockServer, extra: &[&str]) -> std::process::Output {
+    replay_with_contract(config, horizon, "Replay Contract", extra).await
+}
+
+async fn replay_with_contract(
+    config: &Path,
+    horizon: &MockServer,
+    contract: &str,
+    extra: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_txwatch"))
         .args([
             "--config",
@@ -75,7 +84,7 @@ async fn replay(config: &Path, horizon: &MockServer, extra: &[&str]) -> std::pro
             &horizon.uri(),
             "replay",
             "--contract",
-            "Replay Contract",
+            contract,
             "--tx",
             TX_HASH,
         ])
@@ -137,6 +146,36 @@ async fn replay_with_send_delivers_webhooks() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test]
+async fn replay_contract_lookup_is_case_insensitive() {
+    let horizon = horizon_with_admin_call().await;
+    let config = write_config("case_insensitive", "https://hooks.example.com/unused");
+    let output = replay_with_contract(&config, &horizon, "replay contract", &[]).await;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 rule(s) matched transaction replay001"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn replay_unknown_contract_lists_configured_labels() {
+    let horizon = horizon_with_admin_call().await;
+    let config = write_config("unknown_contract", "https://hooks.example.com/unused");
+    let output = replay_with_contract(&config, &horizon, "does-not-exist", &[]).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not found"), "{stderr}");
+    assert!(stderr.contains("Replay Contract"), "{stderr}");
 }
 
 #[tokio::test]

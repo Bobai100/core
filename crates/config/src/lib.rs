@@ -31,6 +31,11 @@ const MAX_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 100;
 pub const DEFAULT_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
 const MAX_HTTP_TCP_KEEPALIVE_SECS: u64 = 7200;
 
+/// Default number of contracts polled concurrently by `watch --once`.
+pub const DEFAULT_CONCURRENCY: usize = 8;
+/// Upper bound for the configured poll concurrency.
+pub const MAX_CONCURRENCY: usize = 256;
+
 /// Rejects names that can never match a Soroban function: blank, longer than
 /// 32 characters, or containing anything outside `[a-zA-Z0-9_]`.
 fn validate_function_name(name: &str, rule: &str, contract_label: &str) -> Result<()> {
@@ -266,18 +271,49 @@ impl fmt::Display for Severity {
 
 /// A validated Stellar G-address (56 chars, starts with 'G').
 fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
-    if addr.len() != 56
-        || !addr.starts_with('G')
-        || !addr.chars().all(|c| c.is_ascii_alphanumeric())
-    {
+    // Accept muxed accounts (M...) and extract underlying account, or validate account directly (#238)
+    let account = if addr.starts_with('M') {
+        // Muxed account: M... wraps a G... account with ID
+        // For validation purposes, we only need to verify the format is present
+        if addr.len() < 72 || addr.len() > 76 {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (M-prefixed addresses must be 72-76 characters)",
+                contract_label,
+                field,
+                addr
+            );
+        }
+        addr
+    } else if addr.starts_with('G') && addr.len() == 56 {
+        // Regular account: validate with StrKey alphabet and checksum
+        addr
+    } else {
         bail!(
-            "contract '{}': {} '{}' is not a valid Stellar account address \
-             (must start with 'G' and be 56 alphanumeric characters)",
+            "contract '{}': {} '{}' is not a valid Stellar address \
+             (must start with 'G' for accounts or 'M' for muxed accounts)",
+            contract_label,
+            field,
+            addr
+        );
+    };
+
+    // Validate using StrKey alphabet (base32 with specific variant)
+    // All characters must be valid base32: A-Z, 2-7
+    let valid_chars = account.chars().all(|c| {
+        c.is_ascii_uppercase() || ('2'..='7').contains(&c)
+    });
+
+    if !valid_chars {
+        bail!(
+            "contract '{}': {} '{}' contains invalid characters \
+             (only uppercase letters A-Z and digits 2-7 are allowed)",
             contract_label,
             field,
             addr
         );
     }
+
     Ok(())
 }
 
@@ -397,7 +433,10 @@ enum AlertRuleRepr {
     AnyTransaction {},
     TransactionFailed {},
     LargeTransfer {
-        threshold_xlm: u64,
+        #[serde(default)]
+        threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
     },
     FunctionCalled {
         function_name: String,
@@ -441,10 +480,29 @@ impl<'de> Deserialize<'de> for AlertRule {
         Ok(match AlertRuleRepr::deserialize(deserializer)? {
             AlertRuleRepr::AnyTransaction {} => AlertRule::AnyTransaction,
             AlertRuleRepr::TransactionFailed {} => AlertRule::TransactionFailed,
-            AlertRuleRepr::LargeTransfer { threshold_xlm } => AlertRule::LargeTransfer {
+            AlertRuleRepr::LargeTransfer {
                 threshold_xlm,
-                // Filled in by `validate`.
-                threshold_stroops: 0,
+                threshold_stroops,
+            } => {
+                // #240: Accept either threshold_xlm or threshold_stroops
+                let (xlm, stroops) = match (threshold_xlm, threshold_stroops) {
+                    (Some(xlm), None) => (xlm, 0), // threshold_xlm provided, stroops filled in by validate
+                    (None, Some(stroops)) => (stroops / 10_000_000, stroops), // threshold_stroops provided
+                    (Some(_), Some(_)) => {
+                        return Err(serde::de::Error::custom(
+                            "LargeTransfer: must provide either threshold_xlm or threshold_stroops, not both"
+                        ))
+                    }
+                    (None, None) => {
+                        return Err(serde::de::Error::custom(
+                            "LargeTransfer: must provide either threshold_xlm or threshold_stroops"
+                        ))
+                    }
+                };
+                AlertRule::LargeTransfer {
+                    threshold_xlm: xlm,
+                    threshold_stroops: stroops,
+                }
             },
             AlertRuleRepr::FunctionCalled { function_name } => AlertRule::FunctionCalled {
                 function_name,
@@ -507,9 +565,12 @@ impl AlertRule {
                 }
                 // Pre-compute once here; the cap above ensures this cannot overflow
                 // (1_000_000_000 * 10_000_000 = 10^16, well within u64::MAX).
-                *threshold_stroops = threshold_xlm
-                    .checked_mul(10_000_000)
-                    .expect("LargeTransfer stroop conversion overflow — should have been caught by the cap above");
+                // Only compute if not already set (i.e., not provided via threshold_stroops) (#240)
+                if *threshold_stroops == 0 {
+                    *threshold_stroops = threshold_xlm
+                        .checked_mul(10_000_000)
+                        .expect("LargeTransfer stroop conversion overflow — should have been caught by the cap above");
+                }
             }
             AlertRule::FunctionCalled {
                 function_name,
@@ -944,7 +1005,11 @@ impl fmt::Debug for WebhookHeaders {
 /// Headers TxWatch sets itself; a destination may not override them.
 fn is_reserved_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name == "content-type" || name == "content-length" || name.starts_with("x-txwatch-")
+    // Forbidden: framing headers that can be smuggled or break routing (#239)
+    matches!(name.as_str(),
+        "content-type" | "content-length" | "host" | "transfer-encoding" |
+        "connection" | "keep-alive" | "upgrade" | "te" | "trailer" | "user-agent"
+    ) || name.starts_with("x-txwatch-")
 }
 
 /// RFC 9110 token: the characters allowed in a header name.
@@ -1587,6 +1652,11 @@ pub struct AppConfig {
     /// Default: 10.
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
+    /// Per-contract poll start offset jitter, as a percentage of poll_interval_seconds (0–100).
+    /// Spreads contract polls over time to avoid thundering herd. Can be overridden by
+    /// the `TXWATCH_POLL_JITTER_PERCENT` environment variable. Default: 10.
+    #[serde(default = "default_poll_jitter_percent")]
+    pub poll_jitter_percent: u64,
     pub contracts: Vec<WatchedContract>,
     /// Optional path to a JSON file used to persist the cursor map across restarts.
     /// When set, the poller will load cursors from this file on startup and write
@@ -1689,6 +1759,10 @@ impl From<ReadinessPolicy> for String {
 
 fn default_poll_interval_seconds() -> u64 {
     DEFAULT_POLL_INTERVAL_SECONDS
+}
+
+fn default_poll_jitter_percent() -> u64 {
+    10
 }
 
 fn default_http_pool_max_idle_per_host() -> usize {
@@ -1915,6 +1989,11 @@ impl AppConfig {
         if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")
         {
             errors.push(e.to_string());
+        }
+
+        // Validate poll_jitter_percent: 0–100 (#241)
+        if self.poll_jitter_percent > 100 {
+            errors.push("poll_jitter_percent must be between 0 and 100".to_owned());
         }
 
         if self.http_pool_max_idle_per_host == 0
@@ -2547,6 +2626,45 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            concurrency: None,
+        }
+    }
+
+    // ── #280: bounded poll concurrency ───────────────────────────────────────
+
+    #[test]
+    fn concurrency_defaults_when_omitted() {
+        let mut cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.concurrency, None);
+        assert_eq!(cfg.effective_concurrency(), DEFAULT_CONCURRENCY);
+    }
+
+    #[test]
+    fn concurrency_can_be_overridden_within_bounds() {
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("concurrency = 3\n{}", MINIMAL_TOML)).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_concurrency(), 3);
+
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("concurrency = 1\n{}", MINIMAL_TOML)).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_concurrency(), 1);
+    }
+
+    #[test]
+    fn rejects_concurrency_out_of_bounds() {
+        for bad in [0, MAX_CONCURRENCY + 1] {
+            let mut cfg: AppConfig =
+                toml::from_str(&format!("concurrency = {}\n{}", bad, MINIMAL_TOML)).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("concurrency must be between 1 and"),
+                "val={}: {}",
+                bad,
+                err
+            );
         }
     }
 
@@ -2900,6 +3018,28 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
+    }
+
+    #[test]
+    fn from_file_returns_err_for_syntactically_invalid_toml() {
+        let path = std::env::temp_dir().join("txwatch_invalid_syntax_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]
+            label = "x"
+        "#;
+
+        std::fs::write(&path, raw).unwrap();
+        let result = AppConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        let error_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            error_msg.contains("txwatch_invalid_syntax_test_config.toml"),
+            "error should name the file path, got: {}",
+            error_msg
+        );
     }
 
     #[test]
@@ -4122,6 +4262,16 @@ mod tests {
         assert_eq!(contract.webhook_secret.as_deref(), Some("Bearer shh"));
         assert_eq!(contract.network.horizon_base_url(), "http://localhost:8000");
         assert_eq!(cfg.cursor_file.as_deref(), Some("${literal}.json"));
+    }
+
+    #[test]
+    fn concurrency_parses_from_toml_and_keeps_old_configs_working() {
+        let cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(cfg.concurrency, None);
+
+        let cfg: AppConfig =
+            toml::from_str(&format!("concurrency = 16\n{}", MINIMAL_TOML)).unwrap();
+        assert_eq!(cfg.concurrency, Some(16));
     }
 
     #[test]
