@@ -26,7 +26,8 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 |-------------------------------|-----------------|----------|---------|-------------|
 | `poll_interval_seconds`       | u64             | no       | `10`    | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. Each contract can override it (see below). |
 | `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive), and each `(network, contract_id)` pair may appear only once. |
-| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. |
+| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. See [Cursor file locking and state](#cursor-file-locking-and-state). |
+| `concurrency`                 | usize           | no       | `10`    | Maximum number of contracts polled concurrently by `txwatch watch --once`. Must be 1–1000. `txwatch watch` polls every contract in its own task and ignores this setting. |
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
@@ -34,6 +35,45 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
+
+### Cursor file locking and state
+
+When `cursor_file` is set, TxWatch takes an exclusive advisory lock on `<cursor_file>.lock` at startup and
+holds it for the lifetime of the process. If the lock is already held — for example because a second TxWatch
+instance (a rolling deploy that has not finished draining) points at the same `cursor_file` — startup fails
+immediately with an error naming the lock file, instead of letting the two instances overwrite each other's
+cursors and deliver duplicate alerts. The lock is released automatically when the process exits, including on
+a crash.
+
+The cursor file is rewritten atomically: the new contents are written to a unique temporary file in the same
+directory (named after the target file, the process ID and a random suffix) and then renamed over the target.
+Concurrent writers therefore never observe a partially written file, and a `cursor_file` whose name already
+ends in `.tmp` is handled correctly because the scratch path is never the target path.
+
+The file is versioned and holds more than cursors:
+
+```json
+{
+  "version": 2,
+  "cursors": { "testnet:CAAA...": "1234567890" },
+  "cooldowns": { "testnet:CAAA...:LargeTransfer(>=10000XLM)": 1705316096 },
+  "no_activity": { "testnet:CAAA...:NoActivity": { "alerting": true, "since": 1705316096 } }
+}
+```
+
+- `version` — format version. Version `2` is written by current releases.
+- `cursors` — per-contract Horizon cursors, keyed `<network>:<contract_id>`.
+- `cooldowns` — per-contract, per-rule timestamp (Unix seconds) of the last alert sent, so `cooldown_seconds`
+  is enforced across restarts and across separate `txwatch watch --once` runs.
+- `no_activity` — per-contract `NoActivity` state, so an open incident is not re-fired after a restart and a
+  recovery alert is still sent if TxWatch restarted while alerting.
+
+Both `txwatch watch` and `txwatch watch --once` load this state at startup and persist it after each poll cycle.
+
+A file written by an older version — either the legacy cursor-only map (keyed by bare contract ID) or a
+version-1 file with a top-level cursor map — is migrated automatically on load: cursors are re-keyed
+`<network>:<contract_id>` where unambiguous, and cooldown and `NoActivity` state starts empty. As before, a
+contract ID watched on several networks cannot be disambiguated from a legacy file and starts from `now`.
 
 > **Horizon rate limits:** Polling too frequently across many contracts can exhaust Horizon's per-IP request quota,
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
@@ -70,7 +110,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_format` | string          | no       | Body shape for `webhook_url`: `txwatch` (default), `slack`, `discord` or `pagerduty`. See [Webhook formats](#webhook-formats). |
 | `webhook_headers` | table          | no       | Extra HTTP headers for `webhook_url`, e.g. `{ "Authorization" = "Bearer ${TOKEN}" }`. See [Custom headers](#custom-headers). |
 | `webhook_routing_key` | string     | no       | PagerDuty integration key; required when `webhook_format = "pagerduty"`, rejected otherwise. Supports interpolation. |
-| `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields). See [Multiple destinations](#multiple-destinations). |
+| `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields), plus `min_severity`, `rule_types`, `template`/`template_file` and `client_cert`/`client_key`/`ca_cert`. See [Multiple destinations](#multiple-destinations). |
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `soroban_rpc_url` | string         | no       | Soroban RPC endpoint used to fetch contract events for `EventEmitted` rules. Defaults to `https://soroban-testnet.stellar.org` (testnet), `https://rpc-futurenet.stellar.org` (futurenet) or the custom network's `rpc_url`. Mainnet has no default, so a mainnet contract with an `EventEmitted` rule must set it. |
@@ -114,7 +154,42 @@ webhook_url = "https://internal.example.com/txwatch"   # txwatch JSON, as before
 as set, and header values as `<redacted>`. `validate --check-webhooks` probes every destination,
 and `txwatch test-webhook --contract <label>` sends a test alert to each of them.
 
-> Only secrets, header values and routing keys are interpolated; `url` is used as written.
+> Only secrets, header values, routing keys, `template_file` and TLS file paths are interpolated;
+> `url` is used as written.
+
+#### Per-destination filters
+
+`[[contracts.webhooks]]` entries can limit which alerts they receive, so one contract can page
+PagerDuty only for critical alerts while Slack gets everything:
+
+| Field          | Type             | Description |
+|----------------|------------------|-------------|
+| `min_severity` | string           | `info`, `warning` or `critical`. Only alerts at or above this severity are delivered; alerts whose rule has no `severity` are skipped. |
+| `rule_types`   | array of strings | Only alerts from these rule types (e.g. `["LargeTransfer", "AdminFunctionCalled"]`) are delivered. Empty or omitted delivers every rule type. |
+
+```toml
+  [[contracts.webhooks]]
+  url          = "https://events.pagerduty.com/v2/enqueue"
+  format       = "pagerduty"
+  routing_key  = "${PAGERDUTY_ROUTING_KEY}"
+  min_severity = "critical"
+```
+
+`txwatch validate` shows each destination's filters.
+
+#### Mutual TLS
+
+Destinations that require client certificates set `client_cert` and `client_key` (PEM file paths,
+set together) and, for a private CA, `ca_cert`. The URL must be `https`. Each such destination gets
+its own HTTP client; the paths support `${ENV_VAR}` interpolation.
+
+```toml
+  [[contracts.webhooks]]
+  url         = "https://alerts.internal.example.com/txwatch"
+  client_cert = "/etc/txwatch/client.pem"
+  client_key  = "${TXWATCH_CLIENT_KEY_PATH}"
+  ca_cert     = "/etc/txwatch/internal-ca.pem"
+```
 
 ### Webhook formats
 
@@ -124,6 +199,7 @@ and `txwatch test-webhook --contract <label>` sends a test alert to each of them
 | `slack`     | [Slack incoming webhook](https://api.slack.com/messaging/webhooks) | `text` fallback plus Block Kit `blocks`: rule, label and network; contract, transaction link, amount, fee, functions and time; explorer, Horizon and alert ID. |
 | `discord`   | [Discord webhook](https://discord.com/developers/docs/resources/webhook) | `content` plus one embed (title = rule, linked to the explorer; fields for contract, transaction, amount, fee, functions, Horizon). Mentions are disabled, so a label can never ping `@everyone`. Red for `TransactionFailed` / `AdminFunctionCalled`, blue otherwise. |
 | `pagerduty` | [PagerDuty Events API v2](https://developer.pagerduty.com/docs/events-api-v2/trigger-events/) (`https://events.pagerduty.com/v2/enqueue`) | A `trigger` event with the destination's `routing_key` and `dedup_key` = the alert's `alert_id`, so redelivering the same alert updates one incident instead of opening a new one. Severity: `error` for `TransactionFailed`, `critical` for `AdminFunctionCalled`, `warning` otherwise. The full alert is attached as `payload.custom_details`. |
+| `template`  | Any HTTP endpoint | The destination's `template` (or the contents of `template_file`), rendered with [minijinja](https://docs.rs/minijinja). See [Body templates](#body-templates). |
 
 Example Slack body:
 
@@ -196,6 +272,26 @@ Example PagerDuty body:
 ```
 
 The exact bodies are pinned by snapshot tests in `crates/notifier/src/format.rs`.
+
+### Body templates
+
+`format = "template"` covers receivers without a built-in format (Opsgenie, Telegram, Mattermost,
+internal APIs). Set exactly one of `template` (inline) or `template_file` (a path read at config
+load). Templates are checked for syntax errors when the config is loaded.
+
+Every field of the [webhook payload](#webhook-payload) is available as a variable (`label`,
+`contract_id`, `network`, `rule_type`, `rule_triggered`, `severity`, `transaction_hash`,
+`amount_xlm`, `explorer_link`, `horizon_link`, `timestamp_iso`, `alert_id`, ...). Values are
+JSON-escaped and quoted automatically, so write `{{ label }}`, not `"{{ label }}"`. Referencing an
+unknown variable fails the delivery. The engine is sandboxed: templates cannot read files or make
+network requests.
+
+```toml
+  [[contracts.webhooks]]
+  url      = "https://chat.example.com/hooks/abc"
+  format   = "template"
+  template = '{"text": {{ rule_triggered }}, "contract": {{ label }}, "link": {{ explorer_link }}}'
+```
 
 ### Custom headers
 
@@ -280,8 +376,10 @@ severity    = "critical"
 
 Every rule accepts an optional `cooldown_seconds` (0–604800). After the rule fires for a contract, further
 matches within that many seconds are suppressed and counted; the next alert that is sent carries the count in
-`suppressed_count`. Unset or `0` disables the cooldown. Cooldown state is kept in memory by `txwatch watch`
-(it resets on restart), so it has no effect across separate `txwatch watch --once` runs.
+`suppressed_count`. Unset or `0` disables the cooldown. Cooldown state is persisted in the `cursor_file` (see
+[Cursor file locking and state](#cursor-file-locking-and-state)) when one is configured, so it is enforced
+across restarts and across separate `txwatch watch --once` runs; without a `cursor_file` it is kept in memory
+and resets on restart.
 
 ```toml
 [[contracts.rules]]
@@ -309,12 +407,29 @@ type = "TransactionFailed"
 ```
 
 ### `LargeTransfer`
-Fires when the payment amount ≥ `threshold_xlm` XLM.
+Fires when the amount moved by the watched contract is ≥ `threshold_xlm` XLM.
+
+Only balance changes where the watched contract is the sender or the receiver are counted: native
+payments, `create_account`, path-payment legs and SAC transfers that do not involve the watched
+contract are ignored, so unrelated traffic in the same transaction can never trigger an alert.
+
+An optional `direction` selects which side of the movement counts:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"any"` (default) | Inflows and outflows are summed together |
+| `"in"` | Only amounts received by the watched contract are counted |
+| `"out"` | Only amounts sent by the watched contract are counted |
 
 ```toml
 [[contracts.rules]]
 type          = "LargeTransfer"
 threshold_xlm = 10000          # must be > 0
+
+[[contracts.rules]]
+type          = "LargeTransfer"
+threshold_xlm = 50000
+direction     = "out"          # only alert on large outflows
 ```
 
 ### `FunctionCalled`
@@ -428,17 +543,78 @@ type = "Not"
 [contracts.rules.rule]
 type = "TransactionFailed"
 ### `EventEmitted`
-Fires when the transaction emitted a Soroban contract event whose first topic is exactly the symbol `topic`
-(a valid Soroban symbol, e.g. `transfer`, `mint`, `admin_changed`). `topics` optionally constrains the following
-topics positionally; `"*"` matches any value. Events are fetched from Soroban RPC `getEvents` (see
-`soroban_rpc_url`); events older than the RPC's retention window (about 7 days on public endpoints) cannot be
-fetched, so this rule will not match them.
+Fires when the transaction emitted a Soroban contract event matching `topic` and, optionally, `topics` and
+`data`. Events are fetched from Soroban RPC `getEvents` (see `soroban_rpc_url`); events older than the RPC's
+retention window (about 7 days on public endpoints) cannot be fetched, so this rule will not match them.
+
+`topic` matches topic 0 and accepts any scalar `ScVal`, not only symbols:
+
+| Pattern | Matches |
+|---------|---------|
+| `transfer` | The symbol `transfer` (a bare word is a symbol, as before) |
+| `symbol:transfer` | The symbol `transfer`, explicitly typed |
+| `string:Transfer` | The string `Transfer` |
+| `address:GAAZI4…` | The address `GAAZI4…` (G- or C-address) |
+| `u32:5`, `i128:-1` | An integer of the given type and value |
+| `bytes:deadbeef` | The bytes `de ad be ef` (hex) |
+
+`topics` optionally constrains the following topics positionally, using the same patterns; `"*"` matches any
+value. A bare word is a symbol, so a string topic must be written `string:…`.
+
+`data` optionally constrains the event's decoded data. Each entry is a table with a JSON pointer into the data
+and a comparison:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `pointer` | yes | [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON pointer into the decoded data, e.g. `""` for the whole value, `/0` for the first element, `/amount` for a field. |
+| `eq`  | one of | Value must equal the given value. |
+| `gte` | one of | Value must be ≥ the given value. |
+| `lte` | one of | Value must be ≤ the given value. |
+
+Exactly one of `eq`, `gte` or `lte` must be set per entry. Values are TOML strings, integers or booleans;
+`i128`/`u128` numbers are compared as integers, so `gte = "1000000000"` works for a token amount. Pointers and
+comparison types are validated at load time: a malformed pointer, an unknown field, or a comparison that cannot
+apply to the value's type is a startup error.
 
 ```toml
 [[contracts.rules]]
 type   = "EventEmitted"
 topic  = "transfer"
 topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this address
+
+  # SEP-41 transfer: data is {"from": …, "to": …, "amount": …}
+  [[contracts.rules.data]]
+  pointer = "/amount"
+  gte     = "1000000000"            # at least 100 tokens (7 decimals)
+
+  [[contracts.rules.data]]
+  pointer = "/to"
+  eq      = "GDESTINATION..."
+
+[[contracts.rules]]
+type  = "EventEmitted"
+topic = "admin_changed"
+
+  # data is the new admin address itself
+  [[contracts.rules.data]]
+  pointer = ""
+  eq      = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "string:Transfer"
+topics = ["address:GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+```
+
+### `ContractUpgraded`
+Fires when the watched contract's executable changes, i.e. its WASM hash is replaced. This catches upgrades
+performed through any function that calls `update_current_contract_wasm`, not only functions named `upgrade`.
+The alert payload includes `old_wasm_hash` and `new_wasm_hash` (hex-encoded SHA-256 of the WASM).
+
+```toml
+[[contracts.rules]]
+type     = "ContractUpgraded"
+severity = "critical"
 ```
 
 ## Webhook payload
@@ -468,6 +644,8 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
   "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123...",
   "resolved":            false,
   "matched_events":      [],
+  "old_wasm_hash":       null,
+  "new_wasm_hash":       null,
   "suppressed_count":    0
 }
 ```
@@ -500,6 +678,7 @@ changes before parsing other fields.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
 - `matched_events` — for `EventEmitted` alerts, the events that matched, each with `contract_id`, `topics` and `data` (decoded `ScVal` JSON, e.g. `{"symbol": "transfer"}`); empty for other rules.
+- `old_wasm_hash` / `new_wasm_hash` — for `ContractUpgraded` alerts, the contract's WASM hash before and after the upgrade (hex); `null` for other rules.
 - `suppressed_count` — matches of this rule suppressed by its `cooldown_seconds` since the previous alert was sent; `0` otherwise.
 - `test` — present and `true` only on payloads sent by `txwatch test-webhook`, which also use
   `rule_type = "TestWebhook"`, the label exactly as given, and the synthetic but valid contract ID
@@ -533,6 +712,13 @@ in an `alerts` array:
 | Variable   | Default | Description                                      |
 |------------|---------|--------------------------------------------------|
 | `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+
+## `watch --once` concurrency
+
+`txwatch watch --once` polls contracts concurrently, bounded by the top-level `concurrency` setting (default
+`10`). This keeps a cron run within its schedule even with many contracts and slow Horizon responses. Lower it
+when Horizon rate limits are a concern; raise it when polling your own Horizon. `txwatch watch` is unaffected:
+it already polls every contract in its own task.
 
 ### Environment variable interpolation
 
@@ -601,4 +787,8 @@ webhook_url = "https://hooks.example.com/my-webhook"
 
   [[contracts.rules]]
   type = "TransactionFailed"
+
+  [[contracts.rules]]
+  type     = "ContractUpgraded"
+  severity = "critical"
 ```

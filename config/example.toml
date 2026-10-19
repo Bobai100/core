@@ -2,6 +2,9 @@ poll_interval_seconds = 10
 # Optional: how often the poller logs a periodic summary line, in seconds.
 # Set to 0 to disable the periodic summary entirely.
 # summary_interval_seconds = 60
+# Optional: maximum number of contracts polled concurrently in a single
+# `watch --once` run. Defaults to 10. Lower it if Horizon rate-limits you.
+# concurrency = 10
 
 [[contracts]]
 label       = "My Escrow Contract"
@@ -14,6 +17,39 @@ webhook_url = "https://hooks.example.com/my-webhook"
   [[contracts.rules]]
   type          = "LargeTransfer"
   threshold_xlm = 10000
+
+  # Only count balance changes where the watched contract is the sender.
+  # direction must be one of: "in" / "out" / "any" (default "any").
+  [[contracts.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 10000
+  direction     = "out"
+
+  # Alert whenever the contract's executable (WASM) changes, e.g. via
+  # `update_current_contract_wasm`. The payload includes the old/new WASM hash.
+  [[contracts.rules]]
+  type     = "ContractUpgraded"
+  severity = "critical"
+
+  # Match a SEP-41 `transfer` event with an amount >= 1000 (i128 compared as an
+  # integer). `data` matchers use JSON pointers into the decoded event data and
+  # support `eq`, `gte` and `lte`.
+  [[contracts.rules]]
+  type = "EventEmitted"
+  # topic 0 may be any scalar ScVal; typed patterns like "address:G...",
+  # "u32:5" or "symbol:transfer" constrain the ScVal type.
+  topic = ["symbol:transfer"]
+    [[contracts.rules.data]]
+    pointer = "/amount"
+    gte     = 1000
+
+  # Match an `admin_changed` event whose data is a specific address.
+  [[contracts.rules]]
+  type = "EventEmitted"
+  topic = ["symbol:admin_changed"]
+    [[contracts.rules.data]]
+    pointer = "/admin"
+    eq      = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"
 
   # A composite rule; its nested entries are `RuleEntry`, which supports the
   # per-rule `webhook_url` / `severity` / `enabled` overrides.

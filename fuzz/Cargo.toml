@@ -1,0 +1,70 @@
+[package]
+name = "txwatch-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+txwatch-config = { path = "../crates/config", features = ["fuzzing"] }
+txwatch-poller = { path = "../crates/poller", features = ["fuzzing"] }
+txwatch-rules = { path = "../crates/rules", features = ["fuzzing"] }
+
+# Kept out of the main workspace so `cargo build` there never needs nightly.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_stroops"
+path = "fuzz_targets/parse_stroops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base64_decode"
+path = "fuzz_targets/base64_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "contract_function_name"
+path = "fuzz_targets/contract_function_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "interpolate"
+path = "fuzz_targets/interpolate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_sse_frame"
+path = "fuzz_targets/parse_sse_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_contract_id"
+path = "fuzz_targets/validate_contract_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glob_match"
+path = "fuzz_targets/glob_match.rs"
+test = false
+doc = false
+bench = false

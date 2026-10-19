@@ -1,0 +1,54 @@
+# Alerting rules for TxWatch's own health. Load with `rule_files:` in
+# prometheus.yml, or via the Helm chart's PrometheusRule (deploy/helm/txwatch).
+# Requires a binary built with `--features metrics` and run with `--metrics-addr`.
+groups:
+  - name: txwatch
+    rules:
+      - alert: TxWatchDown
+        expr: up{job="txwatch"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TxWatch target {{ $labels.instance }} is down"
+          description: "Prometheus has not been able to scrape TxWatch for 5 minutes."
+
+      - alert: TxWatchStalePolls
+        expr: time() - txwatch_last_successful_poll_timestamp_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TxWatch has not polled {{ $labels.contract }} ({{ $labels.network }}) successfully for over 5 minutes"
+          description: "Last successful poll was {{ $value | humanizeDuration }} ago. Alerts for this contract may be missed."
+
+      - alert: TxWatchConsecutivePollFailures
+        expr: txwatch_consecutive_poll_failures >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TxWatch polls of {{ $labels.contract }} ({{ $labels.network }}) keep failing"
+          description: "{{ $value }} consecutive poll failures. Check Horizon reachability and the contract ID."
+
+      - alert: TxWatchWebhookFailureRate
+        expr: |
+          sum by (contract, network) (rate(txwatch_webhook_failures_total[10m]))
+            /
+          clamp_min(sum by (contract, network) (rate(txwatch_alerts_total[10m])), 1e-9)
+            > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Over 10% of TxWatch webhooks for {{ $labels.contract }} ({{ $labels.network }}) are failing"
+          description: "{{ $value | humanizePercentage }} of alerts failed delivery after all retries."
+
+      - alert: TxWatchHorizonSlow
+        expr: |
+          histogram_quantile(0.95, sum by (network, le) (rate(txwatch_horizon_request_duration_seconds_bucket[10m]))) > 5
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Horizon p95 latency on {{ $labels.network }} is above 5s"

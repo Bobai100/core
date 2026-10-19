@@ -8,13 +8,21 @@ use serde::{Deserialize, Serialize};
 /// Live rate information for a liquidity pool or lending market.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoolYield {
+    /// Identifier of the liquidity pool or lending market.
     pub pool_id: String,
+    /// Name of the protocol hosting the pool (e.g. `soroswap`).
     pub protocol: String,
+    /// Symbol of the first reserve token in the pool.
     pub reserve_token_a: String,
+    /// Symbol of the second reserve token, if the pool is a pair.
     pub reserve_token_b: Option<String>,
+    /// Swap fee charged by the pool, in basis points.
     pub fee_rate_bps: u32,
+    /// Annualized yield (APY/APR) as a percentage.
     pub apy: f64,
+    /// Total value locked in the pool, denominated in stroops.
     pub tvl_stroops: u64,
+    /// Unix epoch timestamp of the last rate update.
     pub last_updated_epoch: u64,
 }
 
@@ -24,6 +32,7 @@ pub struct YieldCalculator {
 }
 
 impl YieldCalculator {
+    /// Creates a calculator that queries the given Soroban testnet RPC endpoint.
     pub fn new(testnet_rpc_url: impl Into<String>) -> Self {
         Self {
             testnet_rpc_url: testnet_rpc_url.into(),
@@ -59,6 +68,7 @@ impl YieldCalculator {
         Ok((dynamic_apy, live_reserve_stroops))
     }
 
+    /// Returns the configured Soroban testnet RPC endpoint URL.
     pub fn rpc_url(&self) -> &str {
         &self.testnet_rpc_url
     }

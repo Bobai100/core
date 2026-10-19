@@ -41,10 +41,15 @@ struct JsonRpcRequest<T> {
 }
 
 /// Parameters for Soroban RPC `getEvents`.
+///
+/// Soroban RPC rejects requests that set both `startLedger` and
+/// `pagination.cursor`, so `start_ledger` is omitted whenever a cursor is
+/// present.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetEventsParams {
-    pub start_ledger: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ledger: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<EventFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +221,11 @@ impl SorobanEventStreamer {
     /// Tries each configured endpoint in order, starting from the last known
     /// healthy one, and falls back to the next URL on connection errors or 5xx
     /// responses. The endpoint that served the poll is logged at debug level.
+    ///
+    /// `startLedger` is only sent when no cursor is known, since Soroban RPC
+    /// rejects requests that combine the two. After a page is returned, the
+    /// ledger position advances only past the last event actually delivered so
+    /// unread events between the page and the tip are not skipped.
     pub(crate) async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
         if self.rpc_urls.is_empty() {
             return Err(anyhow!("no Horizon/RPC endpoints configured"));
@@ -228,7 +238,11 @@ impl SorobanEventStreamer {
         };
 
         let params = GetEventsParams {
-            start_ledger: self.current_ledger,
+            start_ledger: if self.last_cursor.is_some() {
+                None
+            } else {
+                Some(self.current_ledger)
+            },
             filters: vec![filter],
             pagination: Some(PaginationParams {
                 limit: 100,
@@ -260,9 +274,21 @@ impl SorobanEventStreamer {
                     if let Some(cursor) = result.cursor.clone() {
                         self.last_cursor = Some(cursor);
                     }
-                    if result.latest_ledger > self.current_ledger {
-                        self.current_ledger = result.latest_ledger;
+
+                    // Advance only past the last event actually returned so
+                    // events between this page and the tip are not skipped.
+                    if let Some(last) = result.events.last() {
+                        self.current_ledger = last.ledger.saturating_add(1);
                     }
+
+                    debug!(
+                        url = %url,
+                        events = result.events.len(),
+                        latest_ledger = result.latest_ledger,
+                        current_ledger = self.current_ledger,
+                        "fetched Soroban events"
+                    );
+
                     return Ok(result.events);
                 }
                 Err(err) => {
@@ -275,11 +301,7 @@ impl SorobanEventStreamer {
         Err(last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed")))
     }
 
-    async fn try_fetch(
-        &self,
-        url: &str,
-        request_body: &JsonRpcRequest<GetEventsParams>,
-    ) -> Result<GetEventsResult> {
+    async fn try_fetch(&self, url: &str, request_body: &JsonRpcRequest<GetEventsParams>) -> Result<GetEventsResult> {
         let response = self
             .client
             .post(url)
@@ -295,21 +317,17 @@ impl SorobanEventStreamer {
             return Err(anyhow!("RPC endpoint {url} returned {status}"));
         }
 
-        let envelope: JsonRpcResponse<GetEventsResult> = response
+        let body: JsonRpcResponse<GetEventsResult> = response
             .json()
             .await
             .with_context(|| format!("decoding getEvents response from {url}"))?;
 
-        if let Some(err) = envelope.error {
-            return Err(anyhow!(
-                "RPC error {} from {url}: {}",
-                err.code, err.message
-            ));
+        if let Some(err) = body.error {
+            return Err(anyhow!("RPC error {}: {}", err.code, err.message));
         }
 
-        envelope
-            .result
-            .ok_or_else(|| anyhow!("empty getEvents result from {url}"))
+        body.result
+            .ok_or_else(|| anyhow!("RPC response from {url} missing result"))
     }
 }
 
@@ -321,4 +339,116 @@ fn build_client() -> Client {
             info!(error = %err, "falling back to default HTTP client");
             Client::new()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn event_json(id: &str, ledger: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "contractId": "CABC",
+            "ledger": ledger,
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "type": "contract",
+            "topic": ["AAA"],
+            "value": { "x": 1 },
+            "inSuccessfulContractCall": true
+        })
+    }
+
+    fn rpc_result(events: Vec<serde_json::Value>, latest_ledger: u64, cursor: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": latest_ledger,
+                "cursor": cursor
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn first_page_sends_start_ledger_without_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc_result(
+                vec![event_json("1-1", 10)],
+                50,
+                Some("cursor-a"),
+            )))
+            .mount(&server)
+            .await;
+
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec!["CABC".into()], 10);
+        let events = streamer.fetch_events().await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(streamer.last_cursor(), Some("cursor-a"));
+        assert_eq!(streamer.current_ledger, 11);
+    }
+
+    #[tokio::test]
+    async fn multi_page_stream_uses_cursor_and_omits_start_ledger() {
+        let server = MockServer::start().await;
+
+        // First page: no cursor yet, startLedger present.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "params": { "startLedger": 10 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc_result(
+                vec![event_json("1-1", 10), event_json("1-2", 11)],
+                50,
+                Some("cursor-a"),
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second page: cursor present, startLedger must be absent.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "params": { "pagination": { "cursor": "cursor-a" } }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc_result(
+                vec![event_json("1-3", 12)],
+                50,
+                Some("cursor-b"),
+            )))
+            .mount(&server)
+            .await;
+
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec!["CABC".into()], 10);
+
+        let first = streamer.fetch_events().await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(streamer.current_ledger, 12);
+
+        let second = streamer.fetch_events().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(streamer.last_cursor(), Some("cursor-b"));
+        assert_eq!(streamer.current_ledger, 13);
+    }
+
+    #[test]
+    fn get_events_params_omits_start_ledger_when_cursor_present() {
+        let params = GetEventsParams {
+            start_ledger: None,
+            filters: vec![],
+            pagination: Some(PaginationParams {
+                limit: 100,
+                cursor: Some("cursor-a".into()),
+            }),
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert!(value.get("startLedger").is_none());
+        assert_eq!(value["pagination"]["cursor"], "cursor-a");
+    }
 }

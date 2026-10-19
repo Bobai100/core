@@ -13,6 +13,10 @@ use tokio::time::MissedTickBehavior;
 /// Consecutive failed polls after which a contract is reported unhealthy.
 pub(crate) const UNHEALTHY_THRESHOLD: u32 = 5;
 
+/// Consecutive webhook delivery failures after which a receiver is reported
+/// unhealthy.
+pub(crate) const WEBHOOK_UNHEALTHY_THRESHOLD: u32 = 5;
+
 /// Upper bound on the delay between polls of a failing contract. A poll
 /// interval longer than this is never shortened.
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(600);
@@ -58,17 +62,62 @@ pub(crate) fn poll_ticker(interval: Duration, offset: Duration) -> tokio::time::
     ticker
 }
 
+/// Result of a single contract poll cycle. Replaces the previous anonymous
+/// `(u64, u64, u64, u64)` tuple so call sites cannot mix up the fields.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PollOutcome {
+    /// Events observed in this cycle.
+    pub(crate) events: u64,
+    /// Events successfully delivered to webhook receivers.
+    pub(crate) webhook_delivered: u64,
+    /// Webhook deliveries that failed in this cycle.
+    pub(crate) webhook_failures: u64,
+    /// Events skipped (e.g. already seen or filtered).
+    pub(crate) skipped: u64,
+}
+
+impl PollOutcome {
+    /// Total events processed in this cycle.
+    pub(crate) fn total(&self) -> u64 {
+        self.events
+            .saturating_add(self.webhook_delivered)
+            .saturating_add(self.webhook_failures)
+            .saturating_add(self.skipped)
+    }
+
+    /// Whether any webhook delivery failed in this cycle.
+    pub(crate) fn has_webhook_failures(&self) -> bool {
+        self.webhook_failures > 0
+    }
+}
+
 /// Failure streak and last-success time for one contract.
-#[derive(Debug, Default)]
+///
+/// Cloneable so the reload path can carry health state forward for contracts
+/// whose rules did not change instead of recreating it (which would forget
+/// failure streaks and re-trigger unhealthy/recovered transitions).
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PollHealth {
     consecutive_failures: u32,
     last_success: Option<Instant>,
     unhealthy: bool,
+    consecutive_webhook_failures: u32,
+    webhook_unhealthy: bool,
 }
 
 impl PollHealth {
     pub(crate) fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
+    }
+
+    /// Consecutive webhook delivery failures across poll cycles.
+    pub(crate) fn consecutive_webhook_failures(&self) -> u32 {
+        self.consecutive_webhook_failures
+    }
+
+    /// Whether the webhook receiver is currently considered unhealthy.
+    pub(crate) fn webhook_unhealthy(&self) -> bool {
+        self.webhook_unhealthy
     }
 
     /// Time since the last successful poll, or `None` if there has been none.
@@ -97,16 +146,59 @@ impl PollHealth {
         recovered
     }
 
+    /// Records the webhook outcome of a poll cycle. Returns `true` exactly
+    /// once per streak: on the cycle that crosses
+    /// [`WEBHOOK_UNHEALTHY_THRESHOLD`] consecutive failures. A cycle with no
+    /// failures resets the streak.
+    pub(crate) fn record_webhook_outcome(&mut self, failures: u64) -> bool {
+        if failures == 0 {
+            self.consecutive_webhook_failures = 0;
+            self.webhook_unhealthy = false;
+            return false;
+        }
+        self.consecutive_webhook_failures = self
+            .consecutive_webhook_failures
+            .saturating_add(failures.min(u32::MAX as u64) as u32);
+        if !self.webhook_unhealthy
+            && self.consecutive_webhook_failures >= WEBHOOK_UNHEALTHY_THRESHOLD
+        {
+            self.webhook_unhealthy = true;
+            return true;
+        }
+        false
+    }
+
     /// Delay before the next poll: `interval` while healthy, doubling with
-    /// every consecutive failure up to `max(MAX_BACKOFF, interval)`.
+    /// every consecutive failure up to `max(MAX_BACKOFF, interval)`. The
+    /// doubled delay is jittered (decorrelated) so contracts that failed
+    /// together do not retry in lockstep and hammer Horizon on recovery.
     pub(crate) fn backoff_delay(&self, interval: Duration) -> Duration {
         if self.consecutive_failures == 0 {
             return interval;
         }
         let shift = self.consecutive_failures.min(16);
         let cap = MAX_BACKOFF.max(interval);
-        interval.saturating_mul(1 << shift).min(cap)
+        let base = interval.saturating_mul(1 << shift).min(cap);
+        jittered(base, cap)
     }
+}
+
+/// Applies decorrelated jitter to `base`: the result is drawn uniformly from
+/// `[base / 2, base]`, then clamped to `cap`. This keeps the delay within the
+/// same order of magnitude while breaking lockstep retries.
+fn jittered(base: Duration, cap: Duration) -> Duration {
+    let half = base / 2;
+    let span = base.saturating_sub(half);
+    let nanos = span.as_nanos();
+    let offset = if nanos == 0 {
+        0
+    } else {
+        // Cheap pseudo-random source; jitter need not be cryptographic.
+        let mut hasher = DefaultHasher::new();
+        Instant::now().hash(&mut hasher);
+        (hasher.finish() % (nanos as u64 + 1)) as u128
+    };
+    half.saturating_add(Duration::from_nanos(offset as u64)).min(cap)
 }
 
 #[cfg(test)]
@@ -119,12 +211,19 @@ mod tests {
         let mut health = PollHealth::default();
         assert_eq!(health.backoff_delay(interval), interval);
 
-        let mut delays = Vec::new();
-        for _ in 0..8 {
+        // Expected deterministic (un-jittered) upper bounds per failure.
+        let upper = [20u64, 40, 80, 160, 320, 600, 600, 600];
+        for &max in &upper {
             health.record_failure();
-            delays.push(health.backoff_delay(interval).as_secs());
+            let delay = health.backoff_delay(interval).as_secs();
+            // Jitter draws from [max/2, max], never exceeding the cap.
+            assert!(
+                delay >= max / 2 && delay <= max,
+                "delay {delay}s out of bounds [{}, {max}]s",
+                max / 2
+            );
+            assert!(delay <= MAX_BACKOFF.as_secs());
         }
-        assert_eq!(delays, vec![20, 40, 80, 160, 320, 600, 600, 600]);
     }
 
     #[test]
@@ -132,7 +231,8 @@ mod tests {
         let interval = Duration::from_secs(3600);
         let mut health = PollHealth::default();
         health.record_failure();
-        assert_eq!(health.backoff_delay(interval), interval);
+        let delay = health.backoff_delay(interval);
+        assert!(delay >= interval / 2 && delay <= interval);
     }
 
     #[test]
@@ -155,6 +255,40 @@ mod tests {
         let mut health = PollHealth::default();
         health.record_failure();
         assert_eq!(health.record_success(), None);
+    }
+
+    #[test]
+    fn webhook_failures_track_streak_and_cross_threshold_once() {
+        let mut health = PollHealth::default();
+        let mut crossings = 0;
+        for _ in 0..WEBHOOK_UNHEALTHY_THRESHOLD + 2 {
+            if health.record_webhook_outcome(1) {
+                crossings += 1;
+            }
+        }
+        assert_eq!(crossings, 1);
+        assert!(health.webhook_unhealthy());
+        assert_eq!(
+            health.consecutive_webhook_failures(),
+            WEBHOOK_UNHEALTHY_THRESHOLD + 2
+        );
+
+        assert!(!health.record_webhook_outcome(0));
+        assert!(!health.webhook_unhealthy());
+        assert_eq!(health.consecutive_webhook_failures(), 0);
+    }
+
+    #[test]
+    fn poll_outcome_exposes_webhook_failures() {
+        let outcome = PollOutcome {
+            events: 3,
+            webhook_delivered: 2,
+            webhook_failures: 1,
+            skipped: 0,
+        };
+        assert!(outcome.has_webhook_failures());
+        assert_eq!(outcome.total(), 6);
+        assert!(!PollOutcome::default().has_webhook_failures());
     }
 
     #[test]

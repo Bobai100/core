@@ -24,8 +24,14 @@ chrono        = { workspace = true }
 hmac          = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
+futures       = { workspace = true }
+minijinja     = { workspace = true }
 
 [dev-dependencies]
 wiremock      = { workspace = true }
 txwatch-config = { path = "../config" }
 tokio         = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "registry"] }
+tokio         = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
+tokio-rustls  = "0.26"
+rustls        = "0.23"

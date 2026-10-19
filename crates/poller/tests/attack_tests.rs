@@ -59,3 +59,32 @@ async fn test_attack_horizon_429_flood_backs_off() {
         "Poller loop ran and handled 429 backoff until timeout"
     );
 }
+
+#[test]
+fn backoff_doubles_and_is_capped() {
+    // Back-off now applies jitter, so we assert bounds rather than exact values.
+    // The base schedule doubles (20, 40, 80, ...) and is capped at 600 s.
+    const CAP_SECS: u64 = 600;
+
+    for attempt in 0..12u32 {
+        let base = 20u64.saturating_mul(1u64 << attempt.min(5));
+        let delay = txwatch_poller::backoff_delay(attempt);
+        let secs = delay.as_secs();
+
+        // Jitter must never exceed the 600 s cap.
+        assert!(
+            secs <= CAP_SECS,
+            "attempt {attempt}: delay {secs}s exceeded cap {CAP_SECS}s"
+        );
+
+        // Jitter must stay within a sane lower bound: at least half the base
+        // (decorrelated/full jitter never collapses below this) and never
+        // exceed the base schedule (or the cap, whichever is smaller).
+        let upper = base.min(CAP_SECS);
+        let lower = upper / 2;
+        assert!(
+            secs >= lower && secs <= upper,
+            "attempt {attempt}: delay {secs}s outside expected bounds [{lower}, {upper}]"
+        );
+    }
+}

@@ -84,6 +84,36 @@ pub async fn send_webhook(
     .await
 }
 
+/// The client to use for `destination`: `client` itself, or a dedicated client
+/// carrying the destination's mTLS identity and extra CA certificate.
+pub fn destination_client(client: &Client, destination: &WebhookDestination) -> Result<Client> {
+    if !destination.has_tls_config() {
+        return Ok(client.clone());
+    }
+    let read = |path: &str| {
+        std::fs::read(path).map_err(|e| anyhow!("cannot read TLS file '{}': {}", path, e))
+    };
+    let mut builder = Client::builder().timeout(Duration::from_secs(15));
+    if let (Some(cert), Some(key)) = (&destination.client_cert, &destination.client_key) {
+        let mut pem = read(cert)?;
+        pem.push(b'\n');
+        pem.extend(read(key)?);
+        builder = builder.identity(
+            reqwest::Identity::from_pem(&pem)
+                .map_err(|e| anyhow!("invalid client certificate or key: {}", e))?,
+        );
+    }
+    if let Some(ca) = &destination.ca_cert {
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_pem(&read(ca)?)
+                .map_err(|e| anyhow!("invalid CA certificate '{}': {}", ca, e))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
+}
+
 /// Deliver `payload` to one configured destination: the body is rendered in
 /// the destination's [`format`](txwatch_config::WebhookFormat), and its
 /// custom headers and secret are applied. Retries as [`send_webhook`] does.
@@ -107,9 +137,11 @@ pub async fn send_to_destination(
         destination.format,
         payload,
         destination.routing_key.as_deref(),
+        destination.template.as_deref(),
     )?;
+    let client = destination_client(client, destination)?;
     deliver(
-        client,
+        &client,
         &destination.url,
         body,
         destination.secret.as_deref(),
@@ -774,10 +806,8 @@ mod tests {
     fn destination(url: String, format: txwatch_config::WebhookFormat) -> WebhookDestination {
         WebhookDestination {
             url,
-            secret: None,
             format,
-            headers: WebhookHeaders::default(),
-            routing_key: None,
+            ..Default::default()
         }
     }
 
@@ -824,7 +854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_posts_alerts_array_once_with_signature_over_the_batch() {
+    async fn destination_with_custom_headers_posts_once() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/hook"))

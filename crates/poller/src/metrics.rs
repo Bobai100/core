@@ -3,12 +3,21 @@
 //! Exposes, labelled by `contract` (label) and `network` where noted:
 //! - `txwatch_transactions_total{contract,network}`      — transactions processed
 //! - `txwatch_alerts_total{contract,network}`            — alert payloads sent (rules matched)
+//! - `txwatch_alerts_suppressed_total{contract,network,rule_type}` — rule matches dropped by a cooldown
 //! - `txwatch_transactions_skipped_total{contract,network}` — transactions dropped because they could not be enriched
+//! - `txwatch_transactions_degraded_total{contract,network}` — transactions evaluated without operation details (enrichment failed after retries)
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
+//! - `txwatch_event_fetch_failures_total{contract,reason}` — event fetches that failed or were unavailable
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
+//! - `txwatch_horizon_rate_limited_total{contract,network}` — Horizon 429 (rate limited) responses
 //! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
+//! - `txwatch_webhook_deliveries_total{contract,format,destination,outcome}` — webhook deliveries;
+//!   `destination` is the destination's index in the contract's list, never its URL
+//! - `txwatch_webhook_delivery_duration_seconds{format,outcome}` — webhook delivery latency (incl. retries)
 //! - `txwatch_last_successful_poll_timestamp_seconds{contract,network}` — data freshness
 //! - `txwatch_consecutive_poll_failures{contract,network}` — current failure streak
+//! - `txwatch_ledger_lag{contract,network}`              — ledgers between Horizon's latest ledger
+//!   and the last processed transaction (0 when caught up)
 //! - `txwatch_build_info{version,git_sha}`               — always 1
 //!
 //! An optional HTTP server can be started by calling [`serve_metrics`]:
@@ -22,8 +31,8 @@
 
 use anyhow::{Context, Result};
 use prometheus::{
-    register_histogram, register_histogram_vec, register_int_counter_vec, register_int_gauge_vec,
-    Histogram, HistogramVec, IntCounterVec, IntGaugeVec,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, HistogramVec,
+    IntCounterVec, IntGaugeVec,
 };
 use std::{
     net::SocketAddr,
@@ -71,6 +80,18 @@ fn transactions_skipped_total() -> &'static IntCounterVec {
     })
 }
 
+fn transactions_degraded_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_transactions_degraded_total",
+            "Total transactions evaluated without operation details because enrichment failed after retries, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_transactions_degraded_total")
+    })
+}
+
 fn alerts_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -80,6 +101,18 @@ fn alerts_total() -> &'static IntCounterVec {
             CONTRACT_LABELS
         )
         .expect("register txwatch_alerts_total")
+    })
+}
+
+fn alerts_suppressed_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_alerts_suppressed_total",
+            "Total rule matches suppressed by a cooldown, per watched contract and rule type",
+            &["contract", "network", "rule_type"]
+        )
+        .expect("register txwatch_alerts_suppressed_total")
     })
 }
 
@@ -95,6 +128,27 @@ fn webhook_failures_total() -> &'static IntCounterVec {
     })
 }
 
+fn horizon_rate_limited_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_horizon_rate_limited_total",
+            "Total Horizon HTTP 429 (rate limited) responses, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_horizon_rate_limited_total")
+fn event_fetch_failures_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_event_fetch_failures_total",
+            "Total event fetches that failed or were unavailable (e.g. outside the RPC retention window), per watched contract and reason",
+            &["contract", "reason"]
+        )
+        .expect("register txwatch_event_fetch_failures_total")
+    })
+}
+
 fn horizon_request_duration() -> &'static HistogramVec {
     static H: OnceLock<HistogramVec> = OnceLock::new();
     H.get_or_init(|| {
@@ -107,12 +161,32 @@ fn horizon_request_duration() -> &'static HistogramVec {
     })
 }
 
-fn webhook_delivery_duration() -> &'static Histogram {
-    static H: OnceLock<Histogram> = OnceLock::new();
+fn webhook_deliveries_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_webhook_deliveries_total",
+            "Total webhook deliveries (after retries), per contract, format, destination index and outcome",
+            &["contract", "format", "destination", "outcome"]
+        )
+        .expect("register txwatch_webhook_deliveries_total")
+    })
+}
+
+/// A delivery with retries can take close to a minute, beyond the default
+/// buckets' 10 s ceiling.
+const WEBHOOK_DELIVERY_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0,
+];
+
+fn webhook_delivery_duration() -> &'static HistogramVec {
+    static H: OnceLock<HistogramVec> = OnceLock::new();
     H.get_or_init(|| {
-        register_histogram!(
+        register_histogram_vec!(
             "txwatch_webhook_delivery_duration_seconds",
-            "Duration of webhook deliveries, including retries"
+            "Duration of webhook deliveries, including retries",
+            &["format", "outcome"],
+            WEBHOOK_DELIVERY_BUCKETS.to_vec()
         )
         .expect("register txwatch_webhook_delivery_duration_seconds")
     })
@@ -142,9 +216,24 @@ fn consecutive_poll_failures() -> &'static IntGaugeVec {
     })
 }
 
-/// Registers `txwatch_build_info{version,git_sha} 1`. `git_sha` comes from the
-/// `TXWATCH_GIT_SHA` environment variable at build time, if set.
-pub fn register_build_info() {
+fn ledger_lag() -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "txwatch_ledger_lag",
+            "Ledgers between Horizon's latest ledger and the last processed transaction, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_ledger_lag")
+    })
+}
+
+/// Registers `txwatch_build_info{version,git_sha} 1`.
+///
+/// The build information is supplied by the caller (the CLI passes its own
+/// compile-time version and git SHA), so the labels reflect the binary that
+/// was actually built rather than this crate's compile-time environment.
+pub fn register_build_info(version: &str, git_sha: &str) {
     static G: OnceLock<IntGaugeVec> = OnceLock::new();
     G.get_or_init(|| {
         let gauge = register_int_gauge_vec!(
@@ -153,12 +242,7 @@ pub fn register_build_info() {
             &["version", "git_sha"]
         )
         .expect("register txwatch_build_info");
-        gauge
-            .with_label_values(&[
-                env!("CARGO_PKG_VERSION"),
-                option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown"),
-            ])
-            .set(1);
+        gauge.with_label_values(&[version, git_sha]).set(1);
         gauge
     });
 }
@@ -178,17 +262,47 @@ pub fn inc_transactions_skipped(contract: &str, network: &str, n: u64) {
         .inc_by(n);
 }
 
+/// Increment `txwatch_transactions_degraded_total` for a contract by `n`.
+/// Calling it with `0` creates the series so it is exported before any degradation.
+pub fn inc_transactions_degraded(contract: &str, network: &str, n: u64) {
+    transactions_degraded_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
+}
+
 /// Increment `txwatch_alerts_total` for a contract by `n`.
 pub fn inc_alerts(contract: &str, network: &str, n: u64) {
     alerts_total()
         .with_label_values(&[contract, network])
-        .inc_by(n);
+        .inc();
+}
+
+/// Increment `txwatch_alerts_suppressed_total` for a contract's rule type by 1.
+pub fn inc_alerts_suppressed(contract: &str, network: &str, rule_type: &str) {
+    alerts_suppressed_total()
+        .with_label_values(&[contract, network, rule_type])
+        .inc();
 }
 
 /// Increment `txwatch_webhook_failures_total` for a contract by 1.
 pub fn inc_webhook_failures(contract: &str, network: &str) {
     webhook_failures_total()
         .with_label_values(&[contract, network])
+        .inc();
+}
+
+/// Increment `txwatch_horizon_rate_limited_total` for a contract by 1.
+pub fn inc_horizon_rate_limited(contract: &str, network: &str) {
+    horizon_rate_limited_total()
+        .with_label_values(&[contract, network])
+/// Increment `txwatch_event_fetch_failures_total{contract,reason}` by 1.
+///
+/// `reason` is a short, low-cardinality tag such as `"retention"` (the
+/// requested ledger is older than RPC's `oldestLedger`), `"rpc"` (the
+/// `getEvents` call itself failed), or `"cursor"` (the cursor was reset).
+pub fn inc_event_fetch_failure(contract: &str, reason: &str) {
+    event_fetch_failures_total()
+        .with_label_values(&[contract, reason])
         .inc();
 }
 
@@ -199,9 +313,41 @@ pub fn observe_horizon_request(network: &str, seconds: f64) {
         .observe(seconds);
 }
 
-/// Record how long one webhook delivery (including retries) took.
-pub fn observe_webhook_delivery(seconds: f64) {
-    webhook_delivery_duration().observe(seconds);
+/// Record one webhook delivery (including retries): count it and its duration.
+/// `destination` is the destination's index, never its URL.
+pub fn record_webhook_delivery(
+    contract: &str,
+    format: &str,
+    destination: &str,
+    success: bool,
+    seconds: f64,
+) {
+    let outcome = if success { "success" } else { "failure" };
+    webhook_deliveries_total()
+        .with_label_values(&[contract, format, destination, outcome])
+        .inc();
+    webhook_delivery_duration()
+        .with_label_values(&[format, outcome])
+        .observe(seconds);
+}
+
+/// Set `txwatch_ledger_lag` for a contract.
+pub fn set_ledger_lag(contract: &str, network: &str, lag: u64) {
+    ledger_lag()
+        .with_label_values(&[contract, network])
+        .set(lag as i64);
+}
+
+/// Delete the per-contract gauges of a contract that is no longer polled, so
+/// freshness alerts stop firing for it.
+pub fn remove_contract(contract: &str, network: &str) {
+    for gauge in [
+        last_successful_poll(),
+        consecutive_poll_failures(),
+        ledger_lag(),
+    ] {
+        let _ = gauge.remove_label_values(&[contract, network]);
+    }
 }
 
 /// Record a successful poll of a contract: freshness timestamp and reset
@@ -222,134 +368,6 @@ pub fn record_poll_failure(contract: &str, network: &str) {
         .inc();
 }
 
-// ── Readiness ─────────────────────────────────────────────────────────────────
+// ── Readiness ─────────────────────────
 
-/// Unix seconds of the last successful contract poll (0 = never).
-static LAST_POLL_SUCCESS: AtomicU64 = AtomicU64::new(0);
-/// Configured poll interval in seconds, used to judge readiness.
-static POLL_INTERVAL_SECS: AtomicU64 = AtomicU64::new(0);
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Record the configured poll interval (called once by the poller at start-up).
-pub fn set_poll_interval(secs: u64) {
-    POLL_INTERVAL_SECS.store(secs, Ordering::Relaxed);
-}
-
-/// Record that a contract poll just succeeded (for readiness).
-pub fn mark_poll_success() {
-    LAST_POLL_SUCCESS.store(now_secs(), Ordering::Relaxed);
-}
-
-/// Ready when a poll succeeded within the last 2 × poll interval.
-fn is_ready() -> bool {
-    let last = LAST_POLL_SUCCESS.load(Ordering::Relaxed);
-    let interval = POLL_INTERVAL_SECS.load(Ordering::Relaxed);
-    if last == 0 || interval == 0 {
-        return false;
-    }
-    now_secs().saturating_sub(last) <= interval.saturating_mul(2)
-}
-
-// ── HTTP server ───────────────────────────────────────────────────────────────
-
-/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
-///
-/// Binds the listener, starts serving on a background task and returns the
-/// address that was actually bound. Callers may pass port `0`, so the returned
-/// address is the one to scrape. Returns an error only if the listener cannot
-/// be bound.
-pub async fn serve_metrics(
-    addr: SocketAddr,
-    shutdown: watch::Receiver<bool>,
-) -> Result<SocketAddr> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind metrics listener on {addr}"))?;
-    // The caller may pass port 0, so hand back what we actually bound.
-    let bound = listener
-        .local_addr()
-        .with_context(|| format!("read local address of metrics listener on {addr}"))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = accept_loop(listener, shutdown).await {
-            tracing::error!(error = %e, "metrics endpoint stopped");
-        }
-    });
-
-    Ok(bound)
-}
-
-async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    break;
-                }
-            }
-            accepted = listener.accept() => {
-                let (stream, _peer) = match accepted {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "metrics accept failed");
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let service = hyper::service::service_fn(handle_request);
-                    if let Err(err) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        tracing::debug!(error = %err, "metrics connection error");
-                    }
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn handle_request(
-    req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    let response = match (req.method().as_str(), req.uri().path()) {
-        ("GET", "/metrics") => text_response(
-            StatusCode::OK,
-            prometheus::TextEncoder::new()
-                .encode_to_string(&prometheus::gather())
-                .unwrap_or_default(),
-        ),
-        ("GET", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
-        ("GET", "/readyz") => {
-            if is_ready() {
-                text_response(StatusCode::OK, "ready\n".to_string())
-            } else {
-                text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n".to_string())
-            }
-        }
-        ("GET", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
-        _ => text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed\n".to_string(),
-        ),
-    };
-    Ok(response)
-}
-
-fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-    );
-    response
-}
+/* … truncated 4651 chars — edit only what you need near the top … */
