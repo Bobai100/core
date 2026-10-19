@@ -81,6 +81,48 @@ webhook_url = "https://hooks.example.com/vault-webhook"
   type          = "FunctionCalled"
   function_name = "withdraw"
 
+  # FunctionCalled with argument matching: alert only when `transfer` is called
+  # with `to` equal to the given address. Arguments are matched by position
+  # (index starts at 0) against the invocation parameters.
+  [[contracts.rules]]
+  type          = "FunctionCalled"
+  function_name = "transfer"
+  args = [
+    { index = 1, eq = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA" },
+  ]
+
+  # Rate rule: alert when the nested rule matches at least 3 times within a
+  # sliding 5-minute window. One alert is emitted per breach with the observed
+  # count.
+  [[contracts.rules]]
+  type           = "Rate"
+  count          = 3
+  window_seconds = 300
+    [contracts.rules.rule]
+    type = "TransactionFailed"
+
+  # Rate rule: alert when `withdraw` is called at least 50 times per hour
+  # (a typical exploit signal).
+  [[contracts.rules]]
+  type           = "Rate"
+  count          = 50
+  window_seconds = 3600
+    [contracts.rules.rule]
+    type          = "FunctionCalled"
+    function_name = "withdraw"
+
+  # Memo rule: alert on a specific memo ID or a memo text prefix. `memo_type`
+  # is optional; when omitted, any memo type is matched.
+  [[contracts.rules]]
+  type      = "Memo"
+  memo_type = "id"
+  equals    = "123456789"
+
+  [[contracts.rules]]
+  type      = "Memo"
+  memo_type = "text"
+  prefix    = "EXCHANGE-"
+
   # A composite rule with a disabled nested entry: the config is preserved but
   # the disabled rule is not evaluated.
   [[contracts.rules]]

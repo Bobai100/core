@@ -465,6 +465,31 @@ function_name = "admin_*"
 match         = "glob"            # same as prefix example above
 ```
 
+An optional `args` array additionally matches the invocation parameters (the Horizon operation's
+`parameters`). Each entry constrains one positional argument:
+
+| Field   | Type   | Required | Description |
+|---------|--------|----------|-------------|
+| `index` | u32    | yes      | Zero-based position of the argument in the invocation. |
+| `eq`    | string | yes      | The argument must equal this value (max 128 characters, trimmed). |
+
+At most 16 entries are allowed and each `index` may appear only once. Arguments are decoded from
+their `ScVal` encoding: `Address` (compared as the `G…`/`C…` StrKey), `Symbol` and `String`
+(compared as text), integer types and `Bool` (compared as their decimal / `true`/`false` string).
+Other types are compared as their compact JSON. An argument that is absent never matches. All `args` entries must match for the rule to fire;
+an empty `args` array is equivalent to omitting it.
+
+```toml
+# transfer where the destination is a specific account
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "transfer"
+args          = [{ index = 1, eq = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN" }]
+```
+
+The decoded invocations are included in the alert payload as `function_args` (see
+[Webhook payload](#webhook-payload)).
+
 ### `AdminFunctionCalled`
 Fires when the invoked function is any entry in `function_names`.
 
@@ -542,6 +567,67 @@ Fires when the nested rule does **not** match (logical NOT).
 type = "Not"
 [contracts.rules.rule]
 type = "TransactionFailed"
+### `Rate`
+Fires when the wrapped `rule` matches at least `count` times within a sliding `window_seconds` window
+for the contract. Unlike `cooldown_seconds`, which only suppresses alerts, `Rate` counts matches and
+emits one alert per breach, carrying the observed count.
+
+| Field            | Type            | Required | Description |
+|------------------|-----------------|----------|-------------|
+| `rule`           | rule table      | yes      | The nested rule whose matches are counted. |
+| `count`          | u64             | yes      | Number of matches that constitutes a breach. 1–1,000,000. |
+| `window_seconds` | u64             | yes      | Length of the sliding window in seconds. 1–604,800 (one week). |
+
+The window slides per contract: matches older than `window_seconds` are discarded before each
+evaluation, and a breach clears the window. The alert's `rule_type` is `"Rate"`, its
+`rule_triggered` is the rate label (e.g. `Rate(10x TransactionFailed in 300s)`), and the observed
+count is reported in the payload as `observed_count`. Rate state is kept in memory by `txwatch watch` (it resets
+on restart), so it has no effect across separate `txwatch watch --once` runs.
+
+```toml
+# at least 50 withdraw calls per hour
+[[contracts.rules]]
+type           = "Rate"
+count          = 50
+window_seconds = 3600
+[contracts.rules.rule]
+type          = "FunctionCalled"
+function_name = "withdraw"
+
+# at least 10 failed transactions in 5 minutes
+[[contracts.rules]]
+type           = "Rate"
+count          = 10
+window_seconds = 300
+[contracts.rules.rule]
+type = "TransactionFailed"
+```
+
+### `Memo`
+Fires when the transaction memo matches. Exchanges and bridges commonly alert on specific memo IDs
+or text prefixes.
+
+| Field       | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `memo_type` | string | no       | Restrict to a memo type: `none`, `text`, `id`, `hash` or `return`. When omitted, any memo type is considered. |
+| `equals`    | string | one of   | The memo must equal this value. |
+| `prefix`    | string | one of   | The memo's text form must start with this value. |
+
+Exactly one of `equals` or `prefix` must be set. Memos are compared in their textual form: `text`
+memos as written, `id` memos as their decimal string, and `hash`/`return` memos as their hex
+encoding. A transaction without a memo (`memo_type = "none"`) never matches.
+
+```toml
+[[contracts.rules]]
+type      = "Memo"
+memo_type = "id"
+equals    = "1234567890"
+
+[[contracts.rules]]
+type   = "Memo"
+prefix = "DEPOSIT-"
+```
+
 ### `EventEmitted`
 Fires when the transaction emitted a Soroban contract event matching `topic` and, optionally, `topics` and
 `data`. Events are fetched from Soroban RPC `getEvents` (see `soroban_rpc_url`); events older than the RPC's
@@ -677,6 +763,8 @@ changes before parsing other fields.
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `function_args` — decoded invocations, as an array of `{ "function_name": "transfer", "args": [{ "index": 0, "value": "G…" }] }` entries (values rendered as text for the decoded `ScVal` types); omitted when the transaction has no decoded invocation parameters.
+- `observed_count` — for `Rate` alerts, the number of matches observed in the sliding window that triggered the alert; omitted for other rules.
 - `matched_events` — for `EventEmitted` alerts, the events that matched, each with `contract_id`, `topics` and `data` (decoded `ScVal` JSON, e.g. `{"symbol": "transfer"}`); empty for other rules.
 - `old_wasm_hash` / `new_wasm_hash` — for `ContractUpgraded` alerts, the contract's WASM hash before and after the upgrade (hex); `null` for other rules.
 - `suppressed_count` — matches of this rule suppressed by its `cooldown_seconds` since the previous alert was sent; `0` otherwise.

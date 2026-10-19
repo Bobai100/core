@@ -22,7 +22,7 @@ use txwatch_config::{AppConfig, WatchedContract, WebhookDestination};
 use txwatch_notifier::{send_to_destination, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{
     check_no_activity, evaluate, ContractEvent, CooldownTracker, EnrichedTransaction, EvalContext,
-    HorizonTransaction, NoActivityState, WarningSuppressor,
+    HorizonTransaction, NoActivityState, RateTracker, WarningSuppressor,
 };
 
 pub mod db_snapshot;
@@ -34,8 +34,6 @@ pub use persistence::{
     acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
     StateWriter,
 };
-pub mod plan_cache;
-pub use plan_cache::{PlanCache, PlanStatistics};
 mod poll_health;
 use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
 
@@ -1372,6 +1370,8 @@ pub struct ContractPollState {
     pub no_activity_states: Vec<NoActivityState>,
     /// Suppresses repeated evaluation warnings for broken rules.
     pub suppressor: WarningSuppressor,
+    /// Sliding-window match counts for `Rate` rules (issue #267).
+    pub rates: RateTracker,
     /// Rule matches dropped by a cooldown in the last poll cycle.
     pub suppressed: u64,
     /// Ledger of the last processed transaction, if Horizon reported one.
@@ -1683,12 +1683,18 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             } else {
                 enriched
             };
-            let payloads = evaluate(
+            let mut payloads = evaluate(
                 &eval_ctx,
                 &contract.rules,
                 &enriched,
                 Some(&state.suppressor),
             );
+            payloads.extend(state.rates.evaluate(
+                &eval_ctx,
+                &contract.rules,
+                &enriched,
+                chrono::Utc::now(),
+            ));
 
             if payloads.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash,
@@ -2666,6 +2672,7 @@ mod tests {
                 rule: AlertRule::FunctionCalled {
                     function_name: "withdraw".into(),
                     match_mode: Default::default(),
+                    args: vec![],
                 },
                 cooldown_seconds: None,
             }],
@@ -3710,6 +3717,7 @@ mod tests {
                         rule: AlertRule::FunctionCalled {
                             function_name: "deposit".into(),
                             match_mode: Default::default(),
+                            args: vec![],
                         },
                         enabled: true,
                         webhook_url: None,

@@ -6,7 +6,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use txwatch_config::{AlertRule, RuleEntry};
-use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext};
+use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext, RateTracker};
 
 fn tx() -> EnrichedTransaction {
     EnrichedTransaction::from_horizon(
@@ -42,6 +42,26 @@ fn rules() -> Vec<RuleEntry> {
     }]
 }
 
+fn rate_rules() -> Vec<RuleEntry> {
+    vec![RuleEntry {
+        enabled: true,
+        webhook_url: None,
+        webhook_secret: None,
+        severity: None,
+        rule: AlertRule::Rate {
+            rule: Box::new(RuleEntry {
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+                rule: AlertRule::AnyTransaction,
+            }),
+            count: 10,
+            window_seconds: 300,
+        },
+    }]
+}
+
 fn bench_evaluate(c: &mut Criterion) {
     let ctx = EvalContext {
         label: "bench",
@@ -54,6 +74,12 @@ fn bench_evaluate(c: &mut Criterion) {
 
     c.bench_function("evaluate/any_transaction", |b| {
         b.iter(|| black_box(evaluate(&ctx, &black_box(rules()), &tx, None)));
+    });
+
+    c.bench_function("evaluate/rate_any_transaction", |b| {
+        let mut rates = RateTracker::new();
+        let now = chrono::Utc::now();
+        b.iter(|| black_box(rates.evaluate(&ctx, &black_box(rate_rules()), &tx, now)));
     });
 }
 

@@ -298,4 +298,3 @@ Dependabot PRs are subject to exactly the same rules as human PRs:
   overrides to bypass them.
 - If a Dependabot PR cannot be made green (e.g. an upstream release breaks the
   MSRV or a lint), close it and open a tracking issue instead of merging it.
-=======

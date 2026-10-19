@@ -337,6 +337,33 @@ pub enum FunctionMatchMode {
     Glob,
 }
 
+/// Maximum number of argument matchers on a `FunctionCalled` rule.
+pub const MAX_FUNCTION_ARGS: usize = 16;
+
+/// Maximum length of an argument matcher's expected value.
+pub const MAX_ARG_VALUE_LEN: usize = 128;
+
+/// Upper bound for a `Rate` rule's `window_seconds` (one week).
+pub const MAX_RATE_WINDOW_SECONDS: u64 = 7 * 24 * 3600;
+
+/// Upper bound for a `Rate` rule's `count`.
+pub const MAX_RATE_COUNT: u64 = 1_000_000;
+
+/// Matches one invocation argument of a `FunctionCalled` rule (issue #266).
+///
+/// `index` is the zero-based position in the invocation's parameter list;
+/// `eq` is the expected value, compared against the decoded `ScVal`
+/// (Address, Symbol, U32/I128 and String are supported).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArgMatcher {
+    pub index: u32,
+    pub eq: String,
+}
+
+/// Accepted `memo_type` values for the `Memo` rule (issue #268).
+const MEMO_TYPES: &[&str] = &["none", "text", "id", "hash", "return"];
+
 /// Unknown keys in a rule table are rejected (e.g. `threshold_xml` on a
 /// `HighFee` rule, or `function_name` on an `AnyTransaction` rule).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -359,6 +386,10 @@ pub enum AlertRule {
         #[serde(default)]
         #[schemars(default)]
         match_mode: FunctionMatchMode,
+        /// Optional argument matchers (issue #266): every listed argument must
+        /// equal its expected value for the rule to fire.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<ArgMatcher>,
     },
     AdminFunctionCalled {
         function_names: Vec<String>,
@@ -408,6 +439,25 @@ pub enum AlertRule {
         #[serde(default)]
         topics: Vec<String>,
     },
+    /// Fires when the nested rule matches at least `count` times within a
+    /// sliding `window_seconds` window (issue #267). Emits one alert per
+    /// breach with the observed count.
+    Rate {
+        rule: Box<RuleEntry>,
+        count: u64,
+        window_seconds: u64,
+    },
+    /// Fires when the transaction memo matches (issue #268). Exactly one of
+    /// `equals` or `prefix` must be set; `memo_type` optionally constrains the
+    /// memo type (`text`, `id`, `hash`, `return` or `none`).
+    Memo {
+        #[serde(default)]
+        memo_type: Option<String>,
+        #[serde(default)]
+        equals: Option<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
 }
 
 /// A rule entry with optional per-rule overrides.
@@ -445,6 +495,10 @@ enum AlertRuleRepr {
     },
     FunctionCalled {
         function_name: String,
+        #[serde(default)]
+        match_mode: FunctionMatchMode,
+        #[serde(default)]
+        args: Vec<ArgMatcher>,
     },
     AdminFunctionCalled {
         function_names: Vec<String>,
@@ -478,6 +532,19 @@ enum AlertRuleRepr {
         #[serde(default)]
         topics: Vec<String>,
     },
+    Rate {
+        rule: Box<RuleEntry>,
+        count: u64,
+        window_seconds: u64,
+    },
+    Memo {
+        #[serde(default)]
+        memo_type: Option<String>,
+        #[serde(default)]
+        equals: Option<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
 }
 
 impl<'de> Deserialize<'de> for AlertRule {
@@ -509,9 +576,14 @@ impl<'de> Deserialize<'de> for AlertRule {
                     threshold_stroops: stroops,
                 }
             },
-            AlertRuleRepr::FunctionCalled { function_name } => AlertRule::FunctionCalled {
+            AlertRuleRepr::FunctionCalled {
                 function_name,
-                match_mode: FunctionMatchMode::default(),
+                match_mode,
+                args,
+            } => AlertRule::FunctionCalled {
+                function_name,
+                match_mode,
+                args,
             },
             AlertRuleRepr::AdminFunctionCalled { function_names } => {
                 AlertRule::AdminFunctionCalled { function_names }
@@ -533,6 +605,24 @@ impl<'de> Deserialize<'de> for AlertRule {
             AlertRuleRepr::EventEmitted { topic, topics } => {
                 AlertRule::EventEmitted { topic, topics }
             }
+            AlertRuleRepr::Rate {
+                rule,
+                count,
+                window_seconds,
+            } => AlertRule::Rate {
+                rule,
+                count,
+                window_seconds,
+            },
+            AlertRuleRepr::Memo {
+                memo_type,
+                equals,
+                prefix,
+            } => AlertRule::Memo {
+                memo_type,
+                equals,
+                prefix,
+            },
         })
     }
 }
@@ -580,6 +670,7 @@ impl AlertRule {
             AlertRule::FunctionCalled {
                 function_name,
                 match_mode,
+                args,
             } => {
                 if function_name.trim().is_empty() {
                     bail!(
@@ -614,6 +705,39 @@ impl AlertRule {
                                 contract_label
                             );
                         }
+                    }
+                }
+                if args.len() > MAX_FUNCTION_ARGS {
+                    bail!(
+                        "contract '{}': FunctionCalled args must contain at most {} entries",
+                        contract_label,
+                        MAX_FUNCTION_ARGS
+                    );
+                }
+                let mut seen_indices = std::collections::BTreeSet::new();
+                for arg in args.iter_mut() {
+                    if !seen_indices.insert(arg.index) {
+                        bail!(
+                            "contract '{}': FunctionCalled args contains duplicate index {}",
+                            contract_label,
+                            arg.index
+                        );
+                    }
+                    arg.eq = arg.eq.trim().to_owned();
+                    if arg.eq.is_empty() {
+                        bail!(
+                            "contract '{}': FunctionCalled args[{}].eq must not be empty",
+                            contract_label,
+                            arg.index
+                        );
+                    }
+                    if arg.eq.len() > MAX_ARG_VALUE_LEN {
+                        bail!(
+                            "contract '{}': FunctionCalled args[{}].eq must be at most {} characters",
+                            contract_label,
+                            arg.index,
+                            MAX_ARG_VALUE_LEN
+                        );
                     }
                 }
             }
@@ -745,6 +869,83 @@ impl AlertRule {
                     }
                 }
             }
+            AlertRule::Rate {
+                rule,
+                count,
+                window_seconds,
+            } => {
+                if *count == 0 {
+                    bail!(
+                        "contract '{}': Rate count must be > 0",
+                        contract_label
+                    );
+                }
+                if *count > MAX_RATE_COUNT {
+                    bail!(
+                        "contract '{}': Rate count must be <= {}",
+                        contract_label,
+                        MAX_RATE_COUNT
+                    );
+                }
+                if *window_seconds == 0 {
+                    bail!(
+                        "contract '{}': Rate window_seconds must be > 0",
+                        contract_label
+                    );
+                }
+                if *window_seconds > MAX_RATE_WINDOW_SECONDS {
+                    bail!(
+                        "contract '{}': Rate window_seconds must be <= {}",
+                        contract_label,
+                        MAX_RATE_WINDOW_SECONDS
+                    );
+                }
+                rule.validate_at_depth(contract_label, depth + 1)?;
+            }
+            AlertRule::Memo {
+                memo_type,
+                equals,
+                prefix,
+            } => {
+                if let Some(mt) = memo_type.as_mut() {
+                    *mt = mt.trim().to_ascii_lowercase();
+                    if !MEMO_TYPES.contains(&mt.as_str()) {
+                        bail!(
+                            "contract '{}': Memo memo_type {:?} is not one of {}",
+                            contract_label,
+                            mt,
+                            MEMO_TYPES.join(", ")
+                        );
+                    }
+                }
+                match (equals.is_some(), prefix.is_some()) {
+                    (true, true) => bail!(
+                        "contract '{}': Memo: specify either equals or prefix, not both",
+                        contract_label
+                    ),
+                    (false, false) => bail!(
+                        "contract '{}': Memo: one of equals or prefix is required",
+                        contract_label
+                    ),
+                    _ => {}
+                }
+                if let Some(eq) = equals.as_mut() {
+                    if eq.is_empty() {
+                        bail!(
+                            "contract '{}': Memo equals must not be empty",
+                            contract_label
+                        );
+                    }
+                }
+                if let Some(p) = prefix.as_mut() {
+                    if p.is_empty() {
+                        bail!(
+                            "contract '{}': Memo prefix must not be empty",
+                            contract_label
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -773,13 +974,27 @@ impl AlertRule {
             AlertRule::FunctionCalled {
                 function_name,
                 match_mode,
-            } => match match_mode {
-                FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
-                FunctionMatchMode::Prefix => {
-                    format!("FunctionCalled(prefix:{})", function_name)
+                args,
+            } => {
+                let base = match match_mode {
+                    FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
+                    FunctionMatchMode::Prefix => {
+                        format!("FunctionCalled(prefix:{})", function_name)
+                    }
+                    FunctionMatchMode::Glob => {
+                        format!("FunctionCalled(glob:{})", function_name)
+                    }
+                };
+                if args.is_empty() {
+                    base
+                } else {
+                    let rendered: Vec<String> = args
+                        .iter()
+                        .map(|a| format!("[{}]={}", a.index, a.eq))
+                        .collect();
+                    format!("{}({})", base, rendered.join(", "))
                 }
-                FunctionMatchMode::Glob => format!("FunctionCalled(glob:{})", function_name),
-            },
+            }
             AlertRule::AdminFunctionCalled { function_names } => {
                 format!("AdminFunctionCalled([{}])", function_names.join(", "))
             }
@@ -816,6 +1031,30 @@ impl AlertRule {
             }
             AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
             AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
+            AlertRule::Rate {
+                rule,
+                count,
+                window_seconds,
+            } => format!(
+                "Rate({}x {} in {}s)",
+                count,
+                rule.rule.label(),
+                window_seconds
+            ),
+            AlertRule::Memo {
+                memo_type,
+                equals,
+                prefix,
+            } => {
+                let kind = memo_type.as_deref().unwrap_or("any");
+                if let Some(eq) = equals {
+                    format!("Memo({}:={})", kind, eq)
+                } else if let Some(p) = prefix {
+                    format!("Memo({}:^{})", kind, p)
+                } else {
+                    format!("Memo({})", kind)
+                }
+            }
         }
     }
 
@@ -835,6 +1074,8 @@ impl AlertRule {
             AlertRule::Not { .. } => "Not",
             AlertRule::NoActivity { .. } => "NoActivity",
             AlertRule::EventEmitted { .. } => "EventEmitted",
+            AlertRule::Rate { .. } => "Rate",
+            AlertRule::Memo { .. } => "Memo",
         }
     }
 }
@@ -2509,6 +2750,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "  ".into(),
             match_mode: Default::default(),
+            args: vec![],
         })];
         assert!(c.validate().is_err());
     }
@@ -3216,6 +3458,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(33),
             match_mode: Default::default(),
+            args: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("contract 'Test'"), "got: {}", err);
@@ -3233,6 +3476,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(32),
             match_mode: Default::default(),
+            args: vec![],
         })];
         assert!(c.validate().is_ok());
     }
@@ -3244,6 +3488,7 @@ mod tests {
             c.rules = vec![rule(AlertRule::FunctionCalled {
                 function_name: name.into(),
                 match_mode: Default::default(),
+                args: vec![],
             })];
             let err = c.validate().unwrap_err().to_string();
             assert!(
@@ -3261,6 +3506,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "withdraw ".into(),
             match_mode: Default::default(),
+            args: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("\"withdraw \""), "got: {}", err);
@@ -3842,6 +4088,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
                 RuleEntry {
@@ -4567,6 +4814,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "deposit".into(),
                         match_mode: FunctionMatchMode::Exact,
+                        args: vec![],
                     },
                     enabled: true,
                     webhook_url: None,

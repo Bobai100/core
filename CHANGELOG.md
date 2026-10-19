@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FunctionCalled` argument matching: `args = [{ index = 1, eq = "G…" }]` matches decoded invocation parameters (Address, Symbol, integer and String `ScVal`s); decoded invocations are included in the alert payload as `function_args` (#266).
+- `Rate { rule, count, window_seconds }` alert rule: fires when the wrapped rule matches at least `count` times within a sliding `window_seconds` window per contract, emitting one alert per breach with the observed count (#267).
+- `Memo { memo_type, equals | prefix }` alert rule: matches transaction memos by type and exact value or text prefix, with validation (#268).
 - `NoActivity { minutes }` alert rule: fires once when a contract goes quiet longer than the configured threshold, and again (with `resolved = true`) when activity resumes. Evaluated per poll cycle, not per transaction. Null transaction hash and synthetic Horizon/Explorer links are used for the alert payload (#62).
 - `EvalContext` struct replaces the five positional `&str` parameters of `evaluate()`, preventing argument-order bugs at compile time; `EvalContext::from_contract` derives all fields from a `WatchedContract` (#59).
 - `WarningSuppressor`: repeated rule evaluation errors for the same rule are logged on the first occurrence and every 100th recurrence thereafter, preventing log flooding from structurally broken rules (#60).
@@ -27,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - `PlanCache` (and its `txwatch-poller` re-export) removed as dead code: it cached results for a `GET /api/analytics/plan-statistics` endpoint that TxWatch does not have (#292).
+- **Breaking:** `YieldCalculator` and `PoolYield` are no longer exported from `txwatch-rules`. The module returned hard-coded "live" testnet data, ignored `pool_id`, and performed I/O in a crate documented as pure; it had no callers. Use a dedicated crate for live yield queries (#269).
 
 
 - `X-TxWatch-Version` header on every webhook request
