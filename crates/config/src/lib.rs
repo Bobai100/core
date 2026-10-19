@@ -401,6 +401,8 @@ enum AlertRuleRepr {
     },
     FunctionCalled {
         function_name: String,
+        #[serde(default)]
+        match_mode: FunctionMatchMode,
     },
     AdminFunctionCalled {
         function_names: Vec<String>,
@@ -446,9 +448,9 @@ impl<'de> Deserialize<'de> for AlertRule {
                 // Filled in by `validate`.
                 threshold_stroops: 0,
             },
-            AlertRuleRepr::FunctionCalled { function_name } => AlertRule::FunctionCalled {
+            AlertRuleRepr::FunctionCalled { function_name, match_mode } => AlertRule::FunctionCalled {
                 function_name,
-                match_mode: FunctionMatchMode::default(),
+                match_mode,
             },
             AlertRuleRepr::AdminFunctionCalled { function_names } => {
                 AlertRule::AdminFunctionCalled { function_names }
@@ -1619,6 +1621,10 @@ pub struct AppConfig {
     /// continues from the saved cursor on the next cycle. Default: 10.
     #[serde(default)]
     pub max_pages_per_cycle: Option<usize>,
+    /// How often the poller logs a periodic summary line, in seconds.
+    /// Set to `0` to disable the periodic summary entirely. Default: 60.
+    #[serde(default = "default_summary_interval_seconds")]
+    pub summary_interval_seconds: u64,
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -1631,6 +1637,10 @@ fn default_http_pool_max_idle_per_host() -> usize {
 
 fn default_http_tcp_keepalive_secs() -> u64 {
     DEFAULT_HTTP_TCP_KEEPALIVE_SECS
+}
+
+fn default_summary_interval_seconds() -> u64 {
+    60
 }
 
 fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
@@ -1750,6 +1760,34 @@ fn resolve_destination(
     Ok(())
 }
 
+/// Interpolates env-var references in a [`RuleEntry`]'s webhook fields and
+/// recurses into any composite rule's nested entries.
+fn resolve_rule_entry(entry: &mut RuleEntry, path: &str) -> Result<()> {
+    if let Some(url) = &mut entry.webhook_url {
+        resolve_field(url, &format!("{}.webhook_url", path))?;
+    }
+    if let Some(secret) = &mut entry.webhook_secret {
+        resolve_field(secret, &format!("{}.webhook_secret", path))?;
+    }
+    match &mut entry.rule {
+        AlertRule::All { rules } => {
+            for (k, nested) in rules.iter_mut().enumerate() {
+                resolve_rule_entry(nested, &format!("{}.rules[{}]", path, k))?;
+            }
+        }
+        AlertRule::Any { rules } => {
+            for (k, nested) in rules.iter_mut().enumerate() {
+                resolve_rule_entry(nested, &format!("{}.rules[{}]", path, k))?;
+            }
+        }
+        AlertRule::Not { rule } => {
+            resolve_rule_entry(rule, &format!("{}.rule", path))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl AppConfig {
     /// Expands `${VAR}` references in every string field that may carry a
     /// secret or a deployment-specific value.
@@ -1772,6 +1810,8 @@ impl AppConfig {
             // Each entry of the `webhooks` array is a destination in its own right.
             for (j, destination) in contract.webhooks.iter_mut().enumerate() {
                 let field = |name: &str| format!("contracts[{}].webhooks[{}].{}", i, j, name);
+                // Interpolate the destination URL itself (e.g. Slack URLs with a token path).
+                resolve_field(&mut destination.url, &field("url"))?;
                 resolve_destination(
                     &mut destination.secret,
                     &mut destination.headers,
@@ -1801,6 +1841,38 @@ impl AppConfig {
                     })?);
                 }
             }
+            // Soroban RPC URL on the contract itself.
+            if let Some(rpc_url) = &mut contract.soroban_rpc_url {
+                resolve_field(rpc_url, &field("soroban_rpc_url"))?;
+            }
+            // Rule-level webhook_url / webhook_secret inside composite rules.
+            for (r, rule_cfg) in contract.rules.iter_mut().enumerate() {
+                match &mut rule_cfg.rule {
+                    AlertRule::All { rules } => {
+                        for (k, entry) in rules.iter_mut().enumerate() {
+                            resolve_rule_entry(
+                                entry,
+                                &format!("contracts[{}].rules[{}].rules[{}]", i, r, k),
+                            )?;
+                        }
+                    }
+                    AlertRule::Any { rules } => {
+                        for (k, entry) in rules.iter_mut().enumerate() {
+                            resolve_rule_entry(
+                                entry,
+                                &format!("contracts[{}].rules[{}].rules[{}]", i, r, k),
+                            )?;
+                        }
+                    }
+                    AlertRule::Not { rule } => {
+                        resolve_rule_entry(
+                            rule,
+                            &format!("contracts[{}].rules[{}].rule", i, r),
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
             if let Network::Custom(custom) = &mut contract.network {
                 resolve_field(&mut custom.horizon_url, &field("network.horizon_url"))?;
                 if let Some(explorer_url) = &mut custom.explorer_url {
@@ -1808,6 +1880,10 @@ impl AppConfig {
                 }
                 if let Some(passphrase) = &mut custom.passphrase {
                     resolve_field(passphrase, &field("network.passphrase"))?;
+                }
+                // Interpolate the Soroban RPC URL on custom networks.
+                if let Some(rpc_url) = &mut custom.rpc_url {
+                    resolve_field(rpc_url, &field("network.rpc_url"))?;
                 }
             }
         }
@@ -4067,5 +4143,246 @@ mod tests {
         );
         assert!(err.contains("contracts[0].webhook_url"), "got: {}", err);
         assert!(err.contains("TXWATCH_TEST_MISSING"), "got: {}", err);
+    }
+
+    // ── #234: FunctionCalled match_mode ──────────────────────────────────────
+
+    #[test]
+    fn function_called_default_match_mode_is_exact() {
+        let cfg = parse_rule(
+            r#"
+            [[contracts.rules]]
+            type          = "FunctionCalled"
+            function_name = "withdraw"
+            "#,
+        )
+        .unwrap();
+        let rule = &cfg.contracts[0].rules[0].rule;
+        assert!(
+            matches!(
+                rule,
+                AlertRule::FunctionCalled {
+                    match_mode: FunctionMatchMode::Exact,
+                    ..
+                }
+            ),
+            "default match_mode should be Exact, got: {:?}",
+            rule
+        );
+    }
+
+    #[test]
+    fn function_called_prefix_match_mode_parses() {
+        let cfg = parse_rule(
+            r#"
+            [[contracts.rules]]
+            type          = "FunctionCalled"
+            function_name = "admin_"
+            match_mode    = "prefix"
+            "#,
+        )
+        .unwrap();
+        let rule = &cfg.contracts[0].rules[0].rule;
+        assert!(
+            matches!(
+                rule,
+                AlertRule::FunctionCalled {
+                    match_mode: FunctionMatchMode::Prefix,
+                    ..
+                }
+            ),
+            "expected Prefix match_mode, got: {:?}",
+            rule
+        );
+    }
+
+    #[test]
+    fn function_called_glob_match_mode_parses() {
+        let cfg = parse_rule(
+            r#"
+            [[contracts.rules]]
+            type          = "FunctionCalled"
+            function_name = "set_*"
+            match_mode    = "glob"
+            "#,
+        )
+        .unwrap();
+        let rule = &cfg.contracts[0].rules[0].rule;
+        assert!(
+            matches!(
+                rule,
+                AlertRule::FunctionCalled {
+                    match_mode: FunctionMatchMode::Glob,
+                    ..
+                }
+            ),
+            "expected Glob match_mode, got: {:?}",
+            rule
+        );
+    }
+
+    // ── #235: ${VAR} interpolation for webhooks[].url, rule-level fields,
+    //          soroban_rpc_url and network.rpc_url ───────────────────────────
+
+    #[test]
+    fn webhooks_destination_url_interpolated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("TXWATCH_TEST_DEST_URL", "https://hooks.slack.com/services/abc");
+        let raw = format!(
+            r#"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network = "testnet"
+            [[contracts.webhooks]]
+            url = "${{TXWATCH_TEST_DEST_URL}}"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            "#,
+        );
+        let cfg = AppConfig::parse(&raw, Path::new("env.toml"));
+        env::remove_var("TXWATCH_TEST_DEST_URL");
+        let cfg = cfg.unwrap();
+        assert_eq!(
+            cfg.contracts[0].webhooks[0].url,
+            "https://hooks.slack.com/services/abc"
+        );
+    }
+
+    #[test]
+    fn rule_webhook_url_interpolated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("TXWATCH_TEST_RULE_URL", "https://pagerduty.example.com/hook");
+        // rule-level webhook_url lives on RuleEntry inside All/Any/Not composites
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
+            type        = "AnyTransaction"
+            webhook_url = "${TXWATCH_TEST_RULE_URL}"
+        "#;
+        let cfg = AppConfig::parse(raw, Path::new("env.toml"));
+        env::remove_var("TXWATCH_TEST_RULE_URL");
+        let cfg = cfg.unwrap();
+        let AlertRule::All { rules } = &cfg.contracts[0].rules[0].rule else {
+            panic!("expected All rule");
+        };
+        assert_eq!(
+            rules[0].webhook_url.as_deref(),
+            Some("https://pagerduty.example.com/hook")
+        );
+    }
+
+    #[test]
+    fn rule_webhook_secret_interpolated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("TXWATCH_TEST_RULE_SECRET", "my-rule-secret");
+        // rule-level webhook_secret lives on RuleEntry inside All/Any/Not composites
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label       = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network     = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
+            type           = "AnyTransaction"
+            webhook_url    = "https://example.com/hook"
+            webhook_secret = "${TXWATCH_TEST_RULE_SECRET}"
+        "#;
+        let cfg = AppConfig::parse(raw, Path::new("env.toml"));
+        env::remove_var("TXWATCH_TEST_RULE_SECRET");
+        let cfg = cfg.unwrap();
+        let AlertRule::All { rules } = &cfg.contracts[0].rules[0].rule else {
+            panic!("expected All rule");
+        };
+        assert_eq!(
+            rules[0].webhook_secret.as_deref(),
+            Some("my-rule-secret")
+        );
+    }
+
+    #[test]
+    fn soroban_rpc_url_interpolated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("TXWATCH_TEST_RPC_URL", "https://rpc.example.com");
+        let raw = format!(
+            r#"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            soroban_rpc_url = "${{TXWATCH_TEST_RPC_URL}}"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            "#,
+        );
+        let cfg = AppConfig::parse(&raw, Path::new("env.toml"));
+        env::remove_var("TXWATCH_TEST_RPC_URL");
+        let cfg = cfg.unwrap();
+        assert_eq!(
+            cfg.contracts[0].soroban_rpc_url.as_deref(),
+            Some("https://rpc.example.com")
+        );
+    }
+
+    #[test]
+    fn custom_network_rpc_url_interpolated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("TXWATCH_TEST_CUSTOM_RPC", "http://localhost:8000/rpc");
+        let raw = format!(
+            r#"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+            network = {{ horizon_url = "http://localhost:8000", rpc_url = "${{TXWATCH_TEST_CUSTOM_RPC}}" }}
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+            "#,
+        );
+        let cfg = AppConfig::parse(&raw, Path::new("env.toml"));
+        env::remove_var("TXWATCH_TEST_CUSTOM_RPC");
+        let cfg = cfg.unwrap();
+        if let Network::Custom(custom) = &cfg.contracts[0].network {
+            assert_eq!(
+                custom.rpc_url.as_deref(),
+                Some("http://localhost:8000/rpc")
+            );
+        } else {
+            panic!("expected custom network");
+        }
+    }
+
+    // ── #236: summary_interval_seconds ───────────────────────────────────────
+
+    #[test]
+    fn summary_interval_seconds_default_is_60() {
+        let mut cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.summary_interval_seconds, 60);
+    }
+
+    #[test]
+    fn summary_interval_seconds_zero_means_disabled() {
+        let raw = format!("summary_interval_seconds = 0\n{}", MINIMAL_TOML);
+        let cfg = AppConfig::parse(&raw, Path::new("cfg.toml")).unwrap();
+        assert_eq!(cfg.summary_interval_seconds, 0);
+    }
+
+    #[test]
+    fn summary_interval_seconds_custom_value_parses() {
+        let raw = format!("summary_interval_seconds = 120\n{}", MINIMAL_TOML);
+        let cfg = AppConfig::parse(&raw, Path::new("cfg.toml")).unwrap();
+        assert_eq!(cfg.summary_interval_seconds, 120);
     }
 }

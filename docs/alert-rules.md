@@ -96,7 +96,7 @@ threshold_xlm = 10000
 | Field           | Type   | Required | Default   | Description                              |
 |-----------------|--------|----------|-----------|------------------------------------------|
 | `function_name` | string | yes      | —         | Pattern to match against the invoked function name |
-| `match`         | string | no       | `"exact"` | Matching mode: `"exact"`, `"prefix"`, or `"glob"` |
+| `match_mode`    | string | no       | `"exact"` | Matching mode: `"exact"`, `"prefix"`, or `"glob"` |
 
 Matches when the Soroban `invoke_host_function` operation calls a function that satisfies the
 match condition. `"exact"` (the default) requires an identical name; `"prefix"` requires the
@@ -113,13 +113,13 @@ function_name = "withdraw"
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "admin_"
-match         = "prefix"
+match_mode    = "prefix"
 
 # Glob match: fires on set_fee, set_admin, set_pause, …
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "set_*"
-match         = "glob"
+match_mode    = "glob"
 ```
 
 ### `AdminFunctionCalled`
