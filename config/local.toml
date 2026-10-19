@@ -1,11 +1,12 @@
 # TxWatch config for a local stellar/quickstart network (see docker-compose.local.yml).
 poll_interval_seconds = 5
+cursor_file = "/data/cursors.json"
 
 [[contracts]]
 label       = "Local Contract"
 # Replace with the address of a contract deployed to the local network.
 contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
-network     = { horizon_url = "http://stellar:8000", passphrase = "Standalone Network ; February 2017" }
+network     = { horizon_url = "http://stellar:8000", rpc_url = "http://stellar:8000/soroban/rpc", passphrase = "Standalone Network ; February 2017" }
 webhook_url = "http://webhook:8080/txwatch"
 
   [[contracts.rules]]

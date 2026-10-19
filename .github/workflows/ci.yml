@@ -20,9 +20,18 @@ jobs:
       - name: Regenerate and compare config schema
         run: |
           cargo run --quiet -p txwatch -- schema > /tmp/txwatch-config.schema.json
-          jq -e '.properties.poll_interval_seconds and .properties.contracts and ."$defs".WatchedContract and ."$defs".RuleConfig and ."$defs".RuleEntry' /tmp/txwatch-config.schema.json
-          jq -e '.properties.poll_interval_seconds and .properties.contracts and .definitions.WatchedContract and .definitions.AlertRule' docs/txwatch-config.schema.json
-          test "$(jq -r '.properties.contracts.items."$ref"' /tmp/txwatch-config.schema.json)" = "#/$defs/WatchedContract"
+          jq -S . /tmp/txwatch-config.schema.json > /tmp/txwatch-config.schema.sorted.json
+          jq -S . docs/txwatch-config.schema.json > /tmp/txwatch-config.committed.sorted.json
+          diff -u /tmp/txwatch-config.committed.sorted.json /tmp/txwatch-config.schema.sorted.json
+
+  # ── Workflow lint ───────────────────────────────────────────────────────────
+  actionlint:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lint GitHub Actions workflows
+        uses: raven-actions/actionlint@v2
 
   # ── Monitoring assets ───────────────────────────────────────────────────────
   promtool:
@@ -102,10 +111,38 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── Docs ────────────────────────────────────────────────────────────────────
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doc-
+
+      - name: Build docs and deny warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
   # ── Tests ───────────────────────────────────────────────────────────────────
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -144,17 +181,28 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
 
       - name: Check every feature combination
-        run: cargo hack check --workspace --feature-powerset --no-dev-deps
+        run: cargo hack check --workspace --feature-powerset --no-dev-deps --include-features soroban-xdr
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
   msrv:
-    name: MSRV (1.88)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
+      # Read the MSRV from Cargo.toml so the job name and toolchain cannot drift.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].rust_version')
+          echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $msrv"
+
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.120
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.toolchain }}
 
       - name: Check workspace builds on the MSRV
         run: cargo check --workspace --all-targets --locked

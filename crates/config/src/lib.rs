@@ -31,6 +31,11 @@ const MAX_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 100;
 pub const DEFAULT_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
 const MAX_HTTP_TCP_KEEPALIVE_SECS: u64 = 7200;
 
+/// Default number of contracts polled concurrently by `watch --once`.
+pub const DEFAULT_CONCURRENCY: usize = 8;
+/// Upper bound for the configured poll concurrency.
+pub const MAX_CONCURRENCY: usize = 256;
+
 /// Rejects names that can never match a Soroban function: blank, longer than
 /// 32 characters, or containing anything outside `[a-zA-Z0-9_]`.
 fn validate_function_name(name: &str, rule: &str, contract_label: &str) -> Result<()> {
@@ -2476,6 +2481,45 @@ mod tests {
             max_contracts: None,
             max_pages_per_cycle: None,
             cursor_file: None,
+            concurrency: None,
+        }
+    }
+
+    // ── #280: bounded poll concurrency ───────────────────────────────────────
+
+    #[test]
+    fn concurrency_defaults_when_omitted() {
+        let mut cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.concurrency, None);
+        assert_eq!(cfg.effective_concurrency(), DEFAULT_CONCURRENCY);
+    }
+
+    #[test]
+    fn concurrency_can_be_overridden_within_bounds() {
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("concurrency = 3\n{}", MINIMAL_TOML)).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_concurrency(), 3);
+
+        let mut cfg: AppConfig =
+            toml::from_str(&format!("concurrency = 1\n{}", MINIMAL_TOML)).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_concurrency(), 1);
+    }
+
+    #[test]
+    fn rejects_concurrency_out_of_bounds() {
+        for bad in [0, MAX_CONCURRENCY + 1] {
+            let mut cfg: AppConfig =
+                toml::from_str(&format!("concurrency = {}\n{}", bad, MINIMAL_TOML)).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("concurrency must be between 1 and"),
+                "val={}: {}",
+                bad,
+                err
+            );
         }
     }
 
@@ -2829,6 +2873,28 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
+    }
+
+    #[test]
+    fn from_file_returns_err_for_syntactically_invalid_toml() {
+        let path = std::env::temp_dir().join("txwatch_invalid_syntax_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]
+            label = "x"
+        "#;
+
+        std::fs::write(&path, raw).unwrap();
+        let result = AppConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        let error_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            error_msg.contains("txwatch_invalid_syntax_test_config.toml"),
+            "error should name the file path, got: {}",
+            error_msg
+        );
     }
 
     #[test]
@@ -4051,6 +4117,16 @@ mod tests {
         assert_eq!(contract.webhook_secret.as_deref(), Some("Bearer shh"));
         assert_eq!(contract.network.horizon_base_url(), "http://localhost:8000");
         assert_eq!(cfg.cursor_file.as_deref(), Some("${literal}.json"));
+    }
+
+    #[test]
+    fn concurrency_parses_from_toml_and_keeps_old_configs_working() {
+        let cfg: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(cfg.concurrency, None);
+
+        let cfg: AppConfig =
+            toml::from_str(&format!("concurrency = 16\n{}", MINIMAL_TOML)).unwrap();
+        assert_eq!(cfg.concurrency, Some(16));
     }
 
     #[test]

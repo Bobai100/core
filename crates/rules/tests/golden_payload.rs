@@ -59,6 +59,8 @@ fn golden_payload() -> AlertPayload {
         memo: None,
         memo_type: None,
         operation_count: None,
+        old_wasm_hash: None,
+        new_wasm_hash: None,
         resolved: false,
         matched_events: vec![],
         suppressed_count: 0,

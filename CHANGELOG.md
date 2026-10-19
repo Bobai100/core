@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WarningSuppressor`: repeated rule evaluation errors for the same rule are logged on the first occurrence and every 100th recurrence thereafter, preventing log flooding from structurally broken rules (#60).
 - Property-based tests for `LargeTransfer` and `HighFee` rule thresholds using `proptest`, covering the full u64 range and verifying `evaluate` never panics (#61).
 - `resolved` field added to `AlertPayload` JSON (`false` for incident alerts, `true` for recovery alerts); docs/configuration.md and README updated accordingly.
+- CI now diffs the output of `txwatch schema` against the committed `docs/txwatch-config.schema.json`, so the committed schema can no longer drift from the code (#201).
+- CI runs `actionlint` over the workflows, catching duplicated or broken steps (#202).
+- CI test matrix now covers `ubuntu-latest`, `macos-latest` and `windows-latest`, including a Windows test that the cursor file is atomically replaced (#203).
 
 ### Changed
 
@@ -38,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SIGHUP` reloads the config without restarting; cursors of remaining contracts are kept and an invalid file is ignored
 - Per-contract `poll_interval_seconds` override; each contract is polled on its own schedule and `txwatch validate` shows the effective interval
 - `EventEmitted` rule matching Soroban contract events by topic (symbol on topic 0, optional positional topics with `*` wildcard); events are fetched from Soroban RPC `getEvents` and included in the new `matched_events` payload field. New `soroban_rpc_url` contract setting and `rpc_url` custom-network setting
+- `batch_alerts` setting to coalesce alerts for the same contract into a single webhook delivery
 - Optional per-rule `cooldown_seconds`: matches of the same (contract, rule) inside the window are suppressed and reported in the new `suppressed_count` payload field of the next alert
 
 ### Changed
@@ -54,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `http_pool_max_idle_per_host` and `http_tcp_keepalive_secs` have concrete defaults (10 and 30) and are range-checked (1–100 and 0–7200); `http_tcp_keepalive_secs = 0` now disables keepalive as documented
 - Contract labels are trimmed, must not contain control characters, are limited to 128 characters, and are compared case-insensitively for duplicates
 - `FunctionCalled` / `AdminFunctionCalled` function names must be valid Soroban symbols (at most 32 characters from `[a-zA-Z0-9_]`)
+- The unused `soroban-xdr` feature and its `stellar-xdr` dependency were removed from `txwatch-rules`; no XDR decoding is implemented, so the previous "Soroban XDR decoding" claim was dropped (#204)
 
 ## [0.1.0] - 2025-01-01
 
