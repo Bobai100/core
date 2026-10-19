@@ -57,25 +57,39 @@ type = "TransactionFailed"
 
 ### `LargeTransfer`
 
-| Field           | Type | Required | Description                        |
-|-----------------|------|----------|------------------------------------|
-| `threshold_xlm` | u64  | yes      | Minimum transfer amount in XLM (> 0) |
+| Field           | Type   | Required | Default | Description                        |
+|-----------------|--------|----------|---------|------------------------------------|
+| `threshold_xlm` | u64    | yes      | —       | Minimum transfer amount in XLM (> 0) |
+| `direction`     | string | no       | `"any"` | `"in"`, `"out"`, or `"any"` (see below) |
 
-Matches when the payment amount (extracted from Horizon operations) is ≥ `threshold_xlm` XLM.
-The `amount_xlm` field in the webhook payload contains the actual transferred amount.
+Matches when the native XLM amount moved **to or from the watched contract** is ≥
+`threshold_xlm` XLM. The `amount_xlm` field in the webhook payload contains the actual
+transferred amount.
 
-**Note:** The amount is the total native XLM moved by the transaction, summed across:
+**Scoped to the watched contract:** Only balance changes where the watched contract is the
+`from` or `to` party are counted. Native XLM moved by unrelated operations in the same
+transaction (payments between other accounts, `create_account`, path-payment legs, or SAC
+transfers that do not involve the watched contract) is ignored, so a busy transaction cannot
+trigger a "large transfer" on a contract that moved nothing.
 
-- `payment` operations;
-- `create_account` operations (`starting_balance`);
+The counted native XLM balance changes come from:
+
+- `payment` operations where `from` or `to` is the watched contract;
+- `create_account` operations where the watched contract is the funder or the new account;
 - `path_payment_strict_send` / `path_payment_strict_receive` operations, for the native leg
   (`amount` when the destination asset is XLM, otherwise `source_amount` when the source asset
-  is XLM);
+  is XLM), when the watched contract is the source or destination;
 - native `transfer` entries in `asset_balance_changes` on `invoke_host_function` operations
-  (Stellar Asset Contract transfers of XLM).
+  (Stellar Asset Contract transfers of XLM) where the watched contract is `from` or `to`.
 
-Transfers of non-native assets are not counted, and a transaction that moves no native XLM does
-not populate `amount_xlm`.
+**Direction:** `direction` selects which side of the flow is counted:
+
+- `"in"` — only inflows (the watched contract is the `to` party);
+- `"out"` — only outflows (the watched contract is the `from` party);
+- `"any"` (default) — inflows and outflows are summed together.
+
+Transfers of non-native assets are not counted, and a transaction that moves no native XLM
+involving the watched contract does not populate `amount_xlm`.
 
 **Native-only:** Only payments whose `asset_type` is `native` (XLM) are counted. Payments in
 issued assets (`credit_alphanum4` / `credit_alphanum12`, e.g. USDC) are ignored, so a large
@@ -86,9 +100,22 @@ floating point. A native payment with a malformed amount is logged as an error a
 operation details are not used for rule evaluation.
 
 ```toml
+# Any large flow involving the contract (in or out)
 [[contracts.rules]]
 type          = "LargeTransfer"
 threshold_xlm = 10000
+
+# Only large inflows into the contract
+[[contracts.rules]]
+type          = "LargeTransfer"
+threshold_xlm = 10000
+direction     = "in"
+
+# Only large outflows from the contract
+[[contracts.rules]]
+type          = "LargeTransfer"
+threshold_xlm = 5000
+direction     = "out"
 ```
 
 ### `FunctionCalled`
@@ -97,11 +124,40 @@ threshold_xlm = 10000
 |-----------------|--------|----------|-----------|------------------------------------------|
 | `function_name` | string | yes      | —         | Pattern to match against the invoked function name |
 | `match`         | string | no       | `"exact"` | Matching mode: `"exact"`, `"prefix"`, or `"glob"` |
+| `args`          | [arg matcher] | no | unset   | Argument matchers; all must match (see below) |
 
 Matches when the Soroban `invoke_host_function` operation calls a function that satisfies the
 match condition. `"exact"` (the default) requires an identical name; `"prefix"` requires the
 invoked name to start with `function_name`; `"glob"` matches using `*` (any sequence) and `?`
 (exactly one character).
+
+#### Argument matching (`args`)
+
+Each entry in `args` matches one invocation parameter by position:
+
+| Field   | Type | Required | Description |
+|---------|------|----------|-------------|
+| `index` | u32  | yes      | Zero-based position in the operation's `parameters` array |
+| `eq`    | string | yes    | Value the decoded argument must equal exactly (max 128 characters, trimmed) |
+
+At most 16 matchers are allowed and each `index` may appear only once. All matchers must match
+the same invocation for the rule to fire. An argument that is missing does not match, and a rule
+with `args` never fires when the operation parameters could not be decoded.
+
+The following `ScVal` parameter types are decoded to text for comparison:
+
+| ScVal type | Decoded text |
+|------------|--------------|
+| `address`  | The G- or C-address string |
+| `symbol`   | The symbol text |
+| `u32`, `i32`, `u64`, `i64`, `u128`, `i128` | Decimal representation |
+| `bool`     | `true` / `false` |
+| `string`   | The string contents |
+
+Any other type is compared against its compact JSON rendering.
+
+When the rule fires, the decoded invocations are included in the payload as `function_args`
+(see [Webhook payload fields](#webhook-payload-fields)).
 
 ```toml
 # Exact match (default — backward compatible)
@@ -120,6 +176,77 @@ match         = "prefix"
 type          = "FunctionCalled"
 function_name = "set_*"
 match         = "glob"
+
+# Argument match: transfer where the first argument is this address
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "transfer"
+args          = [{ index = 0, eq = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN" }]
+```
+
+### `Rate`
+
+| Field            | Type   | Required | Description |
+|------------------|--------|----------|-------------|
+| `rule`           | rule entry | yes  | The nested rule whose matches are counted |
+| `count`          | u32    | yes      | Number of matches that constitutes a breach (> 0) |
+| `window_seconds` | u64    | yes      | Length of the sliding window in seconds (> 0) |
+
+Fires when the nested `rule` matches at least `count` times within any `window_seconds`
+sliding window for the contract. This expresses rate-based conditions such as "more than 10
+failed transactions in 5 minutes" or "more than 50 `withdraw` calls per hour".
+
+One alert is emitted per breach, and the observed count is included in the payload as
+`observed_count`. The nested rule supports the same options as a top-level rule entry
+(`enabled`, `webhook_url`, `severity`, …). The breach clears the window, so the next alert
+needs another `count` matches. `count` may be at most 1,000,000 and `window_seconds` at most
+604,800 (one week).
+
+```toml
+# At least 10 failed transactions in 5 minutes
+[[contracts.rules]]
+type           = "Rate"
+count          = 10
+window_seconds = 300
+[contracts.rules.rule]
+type = "TransactionFailed"
+
+# At least 50 withdraw calls per hour
+[[contracts.rules]]
+type           = "Rate"
+count          = 50
+window_seconds = 3600
+[contracts.rules.rule]
+type          = "FunctionCalled"
+function_name = "withdraw"
+```
+
+### `Memo`
+
+| Field       | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `memo_type` | string | no       | Memo type to match: `"none"`, `"text"`, `"id"`, `"hash"`, or `"return"`. Omit to match any type |
+| `equals`    | string | one of the two | Exact memo value to match |
+| `prefix`    | string | one of the two | Memo value prefix to match |
+
+Set exactly one of `equals` or `prefix`; setting both is a validation error. Matches when the
+transaction has a memo whose content equals `equals` (or starts with `prefix`) and, when
+`memo_type` is set, whose memo type equals it.
+
+**Use case:** exchanges and bridges alerting on specific memo IDs or text prefixes.
+
+```toml
+# Alert on a specific deposit memo ID
+[[contracts.rules]]
+type      = "Memo"
+memo_type = "id"
+equals    = "123456789"
+
+# Alert on any memo text starting with a known prefix
+[[contracts.rules]]
+type      = "Memo"
+memo_type = "text"
+prefix    = "DEPOSIT-"
 ```
 
 ### `AdminFunctionCalled`
@@ -252,17 +379,49 @@ type = "TransactionFailed"
 
 ### `EventEmitted`
 
-| Field    | Type     | Required | Description                                                         |
-|----------|----------|----------|---------------------------------------------------------------------|
-| `topic`  | string   | yes      | Symbol that event topic 0 must equal exactly (valid Soroban symbol) |
-| `topics` | [string] | no       | Patterns for topics 1, 2, … in order; `"*"` matches any value       |
+| Field    | Type       | Required | Description                                                          |
+|----------|------------|----------|----------------------------------------------------------------------|
+| `topic`  | string     | yes      | Pattern that event topic 0 must match (see below)                    |
+| `topics` | [string]   | no       | Patterns for topics 1, 2, … in order; `"*"` matches any value        |
+| `data`   | [matcher]  | no       | Matchers applied to the event's decoded `data` (see below)           |
 
-Matches when the transaction emitted a contract event whose first topic is the symbol `topic`
-and whose following topics match `topics` positionally. A topic value matches a pattern when:
+Matches when the transaction emitted a contract event whose first topic matches `topic`, whose
+following topics match `topics` positionally, and whose `data` satisfies every `data` matcher.
 
-- it is a single-key scalar `ScVal` (`{"symbol": "x"}`, `{"address": "G…"}`, `{"u32": 5}`,
-  `{"i128": "-1"}`, …) and the inner value's text equals the pattern, or
-- otherwise, its compact JSON equals the pattern.
+#### Topic patterns
+
+`topic` (and each entry of `topics`) may be:
+
+- `"*"` — matches any topic value;
+- a **typed pattern** of the form `<type>:<value>`, which only matches a topic of that ScVal
+  type: `symbol:transfer`, `address:G…`, `u32:5`, `i128:-1`, `string:hello`, `bytes:deadbeef`;
+- a **bare pattern**, which matches any single-key scalar `ScVal` (`{"symbol": "x"}`,
+  `{"address": "G…"}`, `{"u32": 5}`, `{"i128": "-1"}`, …) whose inner value's text equals the
+  pattern, or, for non-scalar values, whose compact JSON equals the pattern.
+
+Topic 0 is **not** required to be a symbol: string, bytes, address, integer or enum topics can
+all be matched. The "valid Soroban symbol" validation only applies when the pattern is a bare
+pattern that is not a typed pattern and topic 0 is expected to be a symbol; typed patterns are
+always accepted.
+
+#### `data` matchers
+
+Each `data` matcher is a table:
+
+| Field     | Type   | Required | Description                                                        |
+|-----------|--------|----------|--------------------------------------------------------------------|
+| `pointer` | string | yes      | JSON pointer into the decoded `data` (e.g. `"/0"`, `"/amount"`, `""` for the whole value) |
+| `eq`      | scalar | one of   | Match when the value at `pointer` equals this value                |
+| `gte`     | scalar | one of   | Match when the value at `pointer` is ≥ this value                  |
+| `lte`     | scalar | one of   | Match when the value at `pointer` is ≤ this value                  |
+
+Exactly one of `eq`, `gte`, `lte` must be set per matcher. Pointers and comparison types are
+validated at load time: a malformed JSON pointer, or a comparison whose type is incompatible
+with the value it is compared against, is a configuration error.
+
+**Integer comparison:** `i128` and `u128` values (decoded as decimal strings) are compared as
+integers, not lexicographically, so `"100"` ≥ `"20"` holds. Other scalars are compared by their
+text/JSON representation.
 
 The matching events (topics and data, as decoded `ScVal` JSON) are included in the
 `matched_events` payload field.
@@ -284,6 +443,53 @@ topic  = "transfer"
 type   = "EventEmitted"
 topic  = "transfer"
 topics = ["*", "GDESTINATION..."]   # any sender, to this address
+
+# Typed topic patterns: only a symbol "transfer" from a specific address
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "symbol:transfer"
+topics = ["address:GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN", "*"]
+
+# SEP-41 transfer with amount >= 1000 (data = [from, to, amount])
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "transfer"
+[[contracts.rules.data]]
+pointer = "/2"
+gte     = "1000"
+
+# admin_changed whose data is a specific address
+[[contracts.rules]]
+type   = "EventEmitted"
+topic  = "admin_changed"
+[[contracts.rules.data]]
+pointer = ""
+eq      = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+```
+
+### `ContractUpgraded`
+
+Matches when the watched contract's executable changes — i.e. its code is upgraded via
+`update_current_contract_wasm` (or an equivalent host call), regardless of which contract
+function triggered it. Detection uses the contract's ledger entry (or the corresponding system
+event) to compare the executable before and after the transaction.
+
+This catches upgrades performed through **any** function, not only one named `upgrade`, which
+`AdminFunctionCalled` alone cannot do.
+
+The webhook payload includes:
+
+| Field           | Type        | Description                                  |
+|-----------------|-------------|----------------------------------------------|
+| `old_wasm_hash` | string/null | Hex WASM hash before the upgrade, or `null` if previously absent |
+| `new_wasm_hash` | string/null | Hex WASM hash after the upgrade              |
+
+**Use case:** the most security-critical event for a monitored contract — alert on any code change.
+
+```toml
+[[contracts.rules]]
+type     = "ContractUpgraded"
+severity = "critical"
 ```
 
 ## Cooldowns
@@ -334,6 +540,8 @@ All matching enabled rules fire; there is no short-circuit.
 | `memo`               | string/null | no             | Memo content (absent for `MemoNone`)     |
 | `memo_type`          | string/null | no             | Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"` |
 | `operation_count`    | u32/null    | no             | Total operations in the transaction      |
+| `arguments`          | [string]    | no             | Decoded invocation arguments (see `FunctionCalled` `args`); present when the rule matched on arguments |
+| `observed_count`     | u32/null    | no             | Number of matches observed in the window for a `Rate` rule |
 | Field              | Type        | Always present | Description                              |
 |--------------------|-------------|----------------|------------------------------------------|
 | `label`            | string      | yes            | Contract label from config               |
@@ -356,6 +564,8 @@ All matching enabled rules fire; there is no short-circuit.
 | `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |
 | `fee_charged_stroops` | u64/null | no             | Fee charged for the transaction in stroops |
 | `matched_events`   | array       | yes            | Events that matched an `EventEmitted` rule (`contract_id`, `topics`, `data`); empty for other rules |
+| `old_wasm_hash`    | string/null | no             | WASM hash before a `ContractUpgraded` match; omitted for other rules |
+| `new_wasm_hash`    | string/null | no             | WASM hash after a `ContractUpgraded` match; omitted for other rules |
 | `suppressed_count` | u64         | yes            | Matches suppressed by this rule's `cooldown_seconds` since the previous alert; `0` otherwise |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
@@ -401,6 +611,9 @@ The webhook payload includes two rule-related fields:
 | `Any` | `"Any"` |
 | `Not` | `"Not"` |
 | `EventEmitted` | `"EventEmitted"` |
+| `ContractUpgraded` | `"ContractUpgraded"` |
+| `Rate` | `"Rate"` |
+| `Memo` | `"Memo"` |
 
 ## Adding a new rule type
 

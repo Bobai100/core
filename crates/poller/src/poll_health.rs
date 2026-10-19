@@ -2,6 +2,8 @@
 //! capped exponential back-off, unhealthy/recovered transitions, and a
 //! deterministic per-contract start offset that spreads polls out in time.
 
+#![allow(dead_code)]
+
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -198,7 +200,8 @@ fn jittered(base: Duration, cap: Duration) -> Duration {
         Instant::now().hash(&mut hasher);
         (hasher.finish() % (nanos as u64 + 1)) as u128
     };
-    half.saturating_add(Duration::from_nanos(offset as u64)).min(cap)
+    half.saturating_add(Duration::from_nanos(offset as u64))
+        .min(cap)
 }
 
 #[cfg(test)]

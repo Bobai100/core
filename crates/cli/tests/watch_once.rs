@@ -189,6 +189,70 @@ async fn once_exits_non_zero_when_webhook_fails() {
     );
 }
 
+/// SIGTERM must route into the graceful shutdown path: the process exits and
+/// the cursor file is flushed.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_flushes_cursor_and_exits() {
+    use std::time::Duration;
+
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+    mount_one_transaction(&horizon).await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let (config_path, cursor_path) = write_config("sigterm", &format!("{}/hook", receiver.uri()));
+
+    let mut child = txwatch_bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--horizon-url",
+            &horizon.uri(),
+            "watch",
+        ])
+        .spawn()
+        .expect("failed to spawn txwatch");
+
+    // Wait for the first cycle to persist the cursor before signalling.
+    let mut flushed = false;
+    for _ in 0..100 {
+        if cursor_path.exists() {
+            flushed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(flushed, "cursor file was never written before SIGTERM");
+
+    let pid = child.id().expect("child pid");
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await
+        .expect("failed to send SIGTERM");
+    assert!(status.success(), "kill -TERM failed");
+
+    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("txwatch did not exit after SIGTERM")
+        .expect("failed to wait for txwatch");
+    assert!(
+        exit.success(),
+        "expected clean exit after SIGTERM, got {exit:?}"
+    );
+
+    let cursors: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file written"))
+            .unwrap();
+    assert_eq!(
+        cursors["testnet:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"],
+        "700"
+    );
 #[tokio::test]
 async fn once_polls_contracts_concurrently() {
     const CONTRACTS: usize = 5;
