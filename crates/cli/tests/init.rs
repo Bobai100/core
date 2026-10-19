@@ -235,7 +235,10 @@ fn init_rule_presets() {
         .args(["--config", output.to_str().unwrap(), "validate"])
         .status()
         .unwrap();
-    assert!(validate.success(), "generated config with rule presets must pass validate");
+    assert!(
+        validate.success(),
+        "generated config with rule presets must pass validate"
+    );
 }
 
 /// #229: --horizon-url embeds a custom horizon_url in the generated config.

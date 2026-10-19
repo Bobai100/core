@@ -65,6 +65,7 @@ fn golden_payload() -> AlertPayload {
         matched_events: vec![],
         suppressed_count: 0,
         test: false,
+        enrichment_incomplete: false,
     }
 }
 

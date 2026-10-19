@@ -406,6 +406,9 @@ pub fn test_payload_with_network(
         matched_events: vec![],
         suppressed_count: 0,
         test: true,
+        old_wasm_hash: None,
+        new_wasm_hash: None,
+        enrichment_incomplete: false,
     }
 }
 
@@ -451,6 +454,9 @@ mod tests {
             matched_events: vec![],
             suppressed_count: 0,
             test: false,
+            old_wasm_hash: None,
+            new_wasm_hash: None,
+            enrichment_incomplete: false,
         }
     }
 

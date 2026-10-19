@@ -488,19 +488,30 @@ threshold_stroops = 1000000
 ### `SourceAccount`
 Fires based on the transaction source account (the G-address that signed and submitted the transaction).
 
-| Field   | Type         | Required | Description |
-|---------|--------------|----------|-------------|
-| `allow` | [G-address]  | no       | If set, only fire when source is one of these addresses. |
-| `deny`  | [G-address]  | no       | If set, fire when source is one of these addresses. |
+| Field          | Type         | Required | Description |
+|----------------|--------------|----------|-------------|
+| `mode`         | string       | no       | `"in"` (default) fires when the source is in `accounts`; `"not_in"` fires when it is not. |
+| `accounts`     | [G-address]  | no       | Accounts the transaction source is matched against. |
+| `alert_unless` | [G-address]  | no       | Allowlist shorthand: sets `accounts` and `mode = "not_in"` in one field. |
+| `allow`        | [G-address]  | no       | *(Deprecated)* Legacy list; equivalent to `mode = "in"` with `accounts`. |
+| `deny`         | [G-address]  | no       | *(Deprecated)* Legacy list; equivalent to `mode = "not_in"` with `accounts`. |
 
-At least one of `allow` or `deny` must be provided. Each entry must be a valid 56-character Stellar G-address.
+At least one address must be provided in `accounts` (or the deprecated `allow`/`deny`). Each entry must be a valid 56-character Stellar G-address. When a transaction has no source account the rule never fires, so `mode = "not_in"` is safe for alerting on unknown callers.
 
 ```toml
-# Only alert when called by an unexpected account (not the known admin)
+# Alert when called by anyone except the known admin (allowlist use case)
 [[contracts.rules]]
-type  = "SourceAccount"
-deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+type     = "SourceAccount"
+mode     = "not_in"
+accounts = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
+
+# Equivalent shorthand:
+[[contracts.rules]]
+type         = "SourceAccount"
+alert_unless = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
 ```
+
+> **Migration Note:** The legacy `allow` and `deny` fields are deprecated. Both historically fired on list *membership*, which surprised users who expected `deny` to mean "alert unless listed". Use `mode = "in"` for a membership match and `mode = "not_in"` (or `alert_unless`) for an allowlist. The legacy fields continue to work.
 
 The `source_account` field is included in the alert payload whenever a source account is present.
 

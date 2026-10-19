@@ -99,19 +99,15 @@ pub struct ContractEvent {
 /// `pointer` is an RFC 6901 JSON pointer into the event's decoded `data`
 /// (e.g. `"/amount"` or `""` for the whole value). `op` selects the
 /// comparison and `value` is the expected value as a string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataMatcher {
-    /// JSON pointer into the event data (`""` addresses the whole value).
-    pub pointer: String,
-    /// Comparison operator: `"eq"`, `"gte"` or `"lte"`.
-    pub op: String,
-    /// Expected value, rendered as text.
-    pub value: String,
+pub use txwatch_config::DataMatcher;
+
+pub trait DataMatcherExt {
+    fn matches(&self, data: &Value) -> bool;
 }
 
-impl DataMatcher {
+impl DataMatcherExt for DataMatcher {
     /// Does `data` satisfy this matcher?
-    pub fn matches(&self, data: &Value) -> bool {
+    fn matches(&self, data: &Value) -> bool {
         let Some(target) = resolve_pointer(data, &self.pointer) else {
             return false;
         };
@@ -161,9 +157,12 @@ fn compare_scval(value: &Value, op: &str, expected: &str) -> bool {
     // Detect a 128-bit integer ScVal and compare numerically.
     let int_text = match value {
         Value::Object(map) if map.len() == 1 => {
-            let (k, v) = map.iter().next()?;
-            if (k == "i128" || k == "u128") && v.is_string() {
-                v.as_str().map(str::to_owned)
+            if let Some((k, v)) = map.iter().next() {
+                if (k == "i128" || k == "u128") && v.is_string() {
+                    v.as_str().map(str::to_owned)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -246,9 +245,10 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     if let Some((ty, rest)) = pattern.split_once(':') {
         if let Value::Object(map) = value {
             if map.len() == 1 {
-                let (k, v) = map.iter().next().unwrap_or((&String::new(), &Value::Null));
-                if k == ty {
-                    return scval_inner_text(v).is_some_and(|text| text == rest);
+                if let Some((k, v)) = map.iter().next() {
+                    if k == ty {
+                        return scval_inner_text(v).is_some_and(|text| text == rest);
+                    }
                 }
                 return false;
             }
@@ -313,6 +313,10 @@ pub struct EnrichedTransaction {
     pub contract_transfers: Vec<ContractTransfer>,
     /// Executable (WASM) change for the watched contract, if any (issue #265).
     pub wasm_upgrade: Option<WasmUpgrade>,
+    /// `true` when the operations fetch failed, so `function_names` and
+    /// `amount_stroops` may be incomplete. Alerts that still fire carry this
+    /// flag so receivers know the evaluation was degraded.
+    pub enrichment_incomplete: bool,
 }
 
 /// A native (XLM) balance movement between two addresses in a transaction.
@@ -335,10 +339,6 @@ pub struct WasmUpgrade {
     pub old_wasm_hash: Option<String>,
     /// New WASM hash (hex).
     pub new_wasm_hash: Option<String>,
-    /// `true` when the operations fetch failed, so `function_names` and
-    /// `amount_stroops` may be incomplete. Alerts that still fire carry this
-    /// flag so receivers know the evaluation was degraded.
-    pub enrichment_incomplete: bool,
 }
 
 impl EnrichedTransaction {
@@ -386,6 +386,7 @@ impl EnrichedTransaction {
             events: Vec::new(),
             contract_transfers: Vec::new(),
             wasm_upgrade: None,
+            enrichment_incomplete: false,
         })
     }
 
@@ -425,10 +426,6 @@ impl EnrichedTransaction {
             }
         }
         matched.then_some(total)
-    }
-
-            enrichment_incomplete: false,
-        })
     }
 
     /// Mark this transaction as evaluated with incomplete enrichment (the
@@ -471,7 +468,7 @@ pub struct AlertPayload {
     pub rule_type: String,
     /// Human-readable description of the rule that fired.
     pub rule_triggered: String,
-    /// Transaction hash, or `null` for synthetic alerts (e.g. `NoActivity`).
+    /// Transaction hash (empty string `""` for synthetic alerts such as `NoActivity`).
     pub transaction_hash: String,
     /// First invoked function name (backward-compat singular field).
     pub function_name: Option<String>,
@@ -552,7 +549,6 @@ pub struct AlertPayload {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enrichment_incomplete: bool,
 }
-=======
 
 /// Deterministic alert ID: the first 32 hex characters (128 bits) of
 /// SHA-256 over `contract_id`, `transaction_hash` and `rule_triggered`.
@@ -875,21 +871,42 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
 
-        AlertRule::SourceAccount { allow, deny } => {
+        AlertRule::SourceAccount {
+            mode,
+            accounts,
+            alert_unless,
+            allow,
+            deny,
+        } => {
             match tx.source_account.as_deref() {
                 None => false,
                 Some(src) => {
-                    let in_allow = allow.iter().any(|a| a == src);
-                    let in_deny = deny.iter().any(|d| d == src);
-                    if !allow.is_empty() {
-                        // `allow` gates the rule; an address on the `deny`
-                        // fire-list still fires, so it can carve out exceptions.
-                        in_allow || in_deny
-                    } else if !deny.is_empty() {
-                        // With no gate, `deny` alone decides.
-                        in_deny
+                    let list = if !accounts.is_empty() {
+                        accounts
+                    } else if !alert_unless.is_empty() {
+                        alert_unless
                     } else {
-                        true
+                        &Vec::new()
+                    };
+                    if !list.is_empty() {
+                        let is_member = list.iter().any(|a| a == src);
+                        match mode {
+                            txwatch_config::SourceAccountMode::In => is_member,
+                            txwatch_config::SourceAccountMode::NotIn => !is_member,
+                        }
+                    } else {
+                        let in_allow = allow.iter().any(|a| a == src);
+                        let in_deny = deny.iter().any(|d| d == src);
+                        if !allow.is_empty() {
+                            // `allow` gates the rule; an address on the `deny`
+                            // fire-list still fires, so it can carve out exceptions.
+                            in_allow || in_deny
+                        } else if !deny.is_empty() {
+                            // With no gate, `deny` alone decides.
+                            in_deny
+                        } else {
+                            true
+                        }
                     }
                 }
             }
@@ -927,7 +944,10 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             topic,
             topics,
             data,
-        } => tx.events.iter().any(|e| e.matches(topic, topics, data)),
+        } => tx
+            .events
+            .iter()
+            .any(|e| e.matches(topic, topics, data.as_slice())),
 
         // #265: fire when the watched contract's executable changed.
         AlertRule::ContractUpgraded => tx
@@ -962,7 +982,7 @@ fn matched_events(rule: &AlertRule, tx: &EnrichedTransaction) -> Vec<ContractEve
         } => tx
             .events
             .iter()
-            .filter(|e| e.matches(topic, topics, data))
+            .filter(|e| e.matches(topic, topics, data.as_slice()))
             .cloned()
             .collect(),
         _ => Vec::new(),
@@ -1000,15 +1020,36 @@ fn rule_label(rule: &AlertRule) -> String {
                 format!("HighFee(>={} stroops)", threshold_stroops)
             }
         }
-        AlertRule::SourceAccount { allow, deny } => {
-            let mut parts = Vec::new();
-            if !allow.is_empty() {
-                parts.push(format!("allow=[{}]", allow.join(", ")));
+        AlertRule::SourceAccount {
+            mode,
+            accounts,
+            alert_unless,
+            allow,
+            deny,
+        } => {
+            let list = if !accounts.is_empty() {
+                accounts
+            } else if !alert_unless.is_empty() {
+                alert_unless
+            } else {
+                &Vec::new()
+            };
+            if !list.is_empty() {
+                let mode_str = match mode {
+                    txwatch_config::SourceAccountMode::In => "in",
+                    txwatch_config::SourceAccountMode::NotIn => "not_in",
+                };
+                format!("SourceAccount({}: [{}])", mode_str, list.join(", "))
+            } else {
+                let mut parts = Vec::new();
+                if !allow.is_empty() {
+                    parts.push(format!("allow=[{}]", allow.join(", ")));
+                }
+                if !deny.is_empty() {
+                    parts.push(format!("deny=[{}]", deny.join(", ")));
+                }
+                format!("SourceAccount({})", parts.join(", "))
             }
-            if !deny.is_empty() {
-                parts.push(format!("deny=[{}]", deny.join(", ")));
-            }
-            format!("SourceAccount({})", parts.join(", "))
         }
         AlertRule::All { rules } => {
             let inner: Vec<String> = rules.iter().map(|e| rule_label(&e.rule)).collect();
@@ -1020,11 +1061,9 @@ fn rule_label(rule: &AlertRule) -> String {
         }
         AlertRule::Not { rule: inner } => format!("Not({})", rule_label(&inner.rule)),
         AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
-        AlertRule::EventEmitted {
-            topic,
-            topics,
-            data,
-        } => txwatch_config::event_emitted_label(topic, topics, data),
+        AlertRule::EventEmitted { topic, topics, .. } => {
+            txwatch_config::event_emitted_label(topic, topics)
+        }
         AlertRule::ContractUpgraded => "ContractUpgraded".into(),
     }
 }
@@ -1036,14 +1075,17 @@ fn rule_label(rule: &AlertRule) -> String {
 /// The poller keeps one `NoActivityState` per `(contract_id, rule_index)` pair
 /// and calls [`check_no_activity`] once per poll cycle — even when there are no
 /// new transactions.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NoActivityState {
     /// The contract is active (or we haven't yet exceeded the threshold).
     #[default]
     Active,
     /// The threshold was exceeded and an alert was fired.  We're in the quiet
     /// window; we will fire a recovery alert the next time a transaction arrives.
-    Alerting,
+    Alerting {
+        #[serde(default)]
+        incident_alert_id: String,
+    },
 }
 
 /// Check the `NoActivity` rule for a single contract after one poll cycle.
@@ -1088,7 +1130,6 @@ pub fn check_no_activity(
     let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     // Synthetic payloads have no transaction — use empty hash and link to Horizon
-    // Synthetic payloads have no transaction — use empty hash and link to Horizon
     // account page rather than a specific transaction.
     let synthetic_hash = String::new();
     let synthetic_horizon_link = format!("{}/accounts/{}", horizon_base, ctx.contract_id);
@@ -1100,15 +1141,18 @@ pub fn check_no_activity(
     match (&*state, is_quiet) {
         // Threshold just exceeded for the first time → fire incident.
         (NoActivityState::Active, true) => {
-            *state = NoActivityState::Alerting;
             let rule_triggered = format!("NoActivity({}min)", minutes);
+            let incident_id = alert_id(ctx.contract_id, &ts.to_string(), &rule_triggered);
+            *state = NoActivityState::Alerting {
+                incident_alert_id: incident_id.clone(),
+            };
             Some(AlertPayload {
                 label: ctx.label.to_string(),
                 contract_id: ctx.contract_id.to_string(),
                 network: ctx.network.to_string(),
                 rule_type: "NoActivity".into(),
-                rule_triggered: rule_triggered.clone(),
-                alert_id: alert_id(ctx.contract_id, &synthetic_hash, &rule_triggered),
+                rule_triggered,
+                alert_id: incident_id,
                 schema_version: 1,
                 amount_stroops: None,
                 amount_xlm_decimal: None,
@@ -1140,9 +1184,17 @@ pub fn check_no_activity(
             })
         }
         // Already alerting and activity has resumed → fire recovery.
-        (NoActivityState::Alerting, false) => {
+        (NoActivityState::Alerting { incident_alert_id }, false) => {
+            let recovery_alert_id = if incident_alert_id.is_empty() {
+                alert_id(
+                    ctx.contract_id,
+                    &ts.to_string(),
+                    &format!("NoActivity({}min) resolved", minutes),
+                )
+            } else {
+                incident_alert_id.clone()
+            };
             *state = NoActivityState::Active;
-            let tx_ts = last_seen.unwrap_or(now);
             let last_horizon_link = match last_seen {
                 Some(_) => format!("{}/accounts/{}", horizon_base, ctx.contract_id),
                 None => synthetic_horizon_link,
@@ -1157,8 +1209,8 @@ pub fn check_no_activity(
                 contract_id: ctx.contract_id.to_string(),
                 network: ctx.network.to_string(),
                 rule_type: "NoActivity".into(),
-                rule_triggered: rule_triggered.clone(),
-                alert_id: alert_id(ctx.contract_id, &synthetic_hash, &rule_triggered),
+                rule_triggered,
+                alert_id: recovery_alert_id,
                 schema_version: 1,
                 amount_stroops: None,
                 amount_xlm_decimal: None,
@@ -1182,21 +1234,20 @@ pub fn check_no_activity(
                 function_names: vec![],
                 amount_xlm: None,
                 fee_charged_stroops: None,
-                timestamp: tx_ts.timestamp(),
-                timestamp_iso: tx_ts.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                timestamp: ts,
+                timestamp_iso: ts_iso,
                 horizon_link: last_horizon_link,
                 explorer_link: last_explorer_link,
                 resolved: true,
             })
         }
-        // No change in state.
         _ => None,
     }
 }
 
 // ── Cooldowns ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct CooldownState {
     last_fired: DateTime<Utc>,
     suppressed: u64,
@@ -1208,9 +1259,27 @@ struct CooldownState {
 /// `suppressed_count`.
 ///
 /// The current time is passed in by the caller, so tests control the clock.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(
+    from = "Vec<((String, String), CooldownState)>",
+    into = "Vec<((String, String), CooldownState)>"
+)]
 pub struct CooldownTracker {
     state: HashMap<(String, String), CooldownState>,
+}
+
+impl From<Vec<((String, String), CooldownState)>> for CooldownTracker {
+    fn from(entries: Vec<((String, String), CooldownState)>) -> Self {
+        Self {
+            state: entries.into_iter().collect(),
+        }
+    }
+}
+
+impl From<CooldownTracker> for Vec<((String, String), CooldownState)> {
+    fn from(tracker: CooldownTracker) -> Self {
+        tracker.state.into_iter().collect()
+    }
 }
 
 impl CooldownTracker {
@@ -1297,6 +1366,95 @@ impl CooldownTracker {
                 Some(0)
             }
         }
+    }
+
+    /// Check for any rules where the cooldown window has expired and
+    /// `suppressed > 0` with `cooldown_summary = true`.
+    /// Emits a summary alert payload for each such rule and resets `suppressed` to 0.
+    pub fn check_summaries(
+        &mut self,
+        rules: &[RuleConfig],
+        ctx: &EvalContext<'_>,
+        now: DateTime<Utc>,
+    ) -> Vec<AlertPayload> {
+        let horizon_base = ctx.horizon_base.trim_end_matches('/');
+        let explorer_base = ctx.explorer_base.map(|b| b.trim_end_matches('/'));
+        let synthetic_horizon_link = format!("{}/accounts/{}", horizon_base, ctx.contract_id);
+        let synthetic_explorer_link = match explorer_base {
+            Some(base) => format!("{}/contract/{}", base, ctx.contract_id),
+            None => synthetic_horizon_link.clone(),
+        };
+
+        let mut summaries = Vec::new();
+
+        for rule_cfg in rules {
+            if !rule_cfg.cooldown_summary {
+                continue;
+            }
+            let cooldown = rule_cfg.cooldown_seconds.unwrap_or(0);
+            if cooldown == 0 {
+                continue;
+            }
+            let window = match i64::try_from(cooldown)
+                .ok()
+                .and_then(chrono::TimeDelta::try_seconds)
+            {
+                Some(w) => w,
+                None => continue,
+            };
+            let rule_trig = rule_label(&rule_cfg.rule);
+            let key = (ctx.contract_id.to_owned(), rule_trig.clone());
+
+            if let Some(state) = self.state.get_mut(&key) {
+                if state.suppressed > 0 && now.signed_duration_since(state.last_fired) >= window {
+                    let suppressed_count = state.suppressed;
+                    state.suppressed = 0;
+                    state.last_fired = now;
+
+                    let ts = now.timestamp();
+                    let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                    let alert_id = alert_id(ctx.contract_id, &ts.to_string(), &rule_trig);
+
+                    summaries.push(AlertPayload {
+                        label: ctx.label.to_string(),
+                        contract_id: ctx.contract_id.to_string(),
+                        network: ctx.network.to_string(),
+                        rule_type: rule_cfg.rule.rule_type().to_string(),
+                        rule_triggered: rule_trig,
+                        alert_id,
+                        schema_version: 1,
+                        amount_stroops: None,
+                        amount_xlm_decimal: None,
+                        source_account: None,
+                        severity: None,
+                        effective_webhook_url: None,
+                        effective_webhook_secret: None,
+                        ledger: None,
+                        memo: None,
+                        memo_type: None,
+                        operation_count: None,
+                        matched_events: vec![],
+                        suppressed_count,
+                        test: false,
+                        old_wasm_hash: None,
+                        new_wasm_hash: None,
+                        enrichment_incomplete: false,
+                        transaction_hash: String::new(),
+                        function_name: None,
+                        function_names: vec![],
+                        amount_xlm: None,
+                        fee_charged_stroops: None,
+                        timestamp: ts,
+                        timestamp_iso: ts_iso,
+                        horizon_link: synthetic_horizon_link.clone(),
+                        explorer_link: synthetic_explorer_link.clone(),
+                        resolved: false,
+                    });
+                }
+            }
+        }
+
+        summaries
     }
 }
 
@@ -1440,6 +1598,7 @@ mod tests {
             AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 10_000 * 10_000_000,
+                direction: "any".into(),
             }
             .label(),
             "LargeTransfer(>=10000XLM)"
@@ -1485,6 +1644,7 @@ mod tests {
             AlertRule::LargeTransfer {
                 threshold_xlm: 1,
                 threshold_stroops: 10_000_000,
+                direction: "any".into(),
             }
             .rule_type(),
             "LargeTransfer"
@@ -1523,6 +1683,7 @@ mod tests {
             AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 10_000 * 10_000_000,
+                direction: "any".into(),
             },
             AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
@@ -1611,6 +1772,7 @@ mod tests {
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 100_000_000_000,
+                direction: "any".into(),
             })],
             &tx,
         );
@@ -1625,6 +1787,7 @@ mod tests {
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 100_000_000_000,
+                direction: "any".into(),
             })],
             &tx,
         );
@@ -1638,6 +1801,7 @@ mod tests {
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 1,
                 threshold_stroops: 0,
+                direction: "any".into(),
             })],
             &tx,
         );
@@ -1653,6 +1817,7 @@ mod tests {
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: u64::MAX,
                 threshold_stroops: u64::MAX,
+                direction: "any".into(),
             })],
             &tx,
         );
@@ -1666,6 +1831,7 @@ mod tests {
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 100_000_000_000,
+                direction: "any".into(),
             })],
             &tx,
         );
@@ -1680,6 +1846,7 @@ mod tests {
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 100_000_000_000,
+                direction: "any".into(),
             })],
             &tx,
         );
@@ -1760,6 +1927,7 @@ mod tests {
             entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
                 threshold_stroops: 100_000_000_000,
+                direction: "any".into(),
             }),
             entry(AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into()],
@@ -1797,7 +1965,8 @@ mod tests {
                 memo: None,
                 memo_type: None,
                 operation_count: None,
-                watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+                watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+                    .into(),
                 events: vec![],
                 contract_transfers: vec![],
                 wasm_upgrade: None,
@@ -1988,6 +2157,7 @@ mod tests {
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 1,
                 threshold_stroops: 10_000_000,
+                direction: "any".into(),
             }],
             &tx,
         );
@@ -2203,6 +2373,7 @@ mod tests {
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
                         threshold_stroops: 100000000000,
+                        direction: "any".into(),
                     },
                 },
             ],
@@ -2239,6 +2410,7 @@ mod tests {
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
                         threshold_stroops: 100000000000,
+                        direction: "any".into(),
                     },
                 },
             ],
@@ -2347,6 +2519,9 @@ mod tests {
         tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                accounts: vec![],
+                alert_unless: vec![],
                 allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 deny: vec![],
             })],
@@ -2362,6 +2537,9 @@ mod tests {
         tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                accounts: vec![],
+                alert_unless: vec![],
                 allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 deny: vec![],
             })],
@@ -2376,6 +2554,9 @@ mod tests {
         tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                accounts: vec![],
+                alert_unless: vec![],
                 allow: vec![],
                 deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
             })],
@@ -2390,6 +2571,9 @@ mod tests {
         tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                accounts: vec![],
+                alert_unless: vec![],
                 allow: vec![],
                 deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
             })],
@@ -2403,6 +2587,9 @@ mod tests {
         let tx = make_tx(true, &[], None); // source_account = None
         let payloads = run(
             &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                accounts: vec![],
+                alert_unless: vec![],
                 allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
                 deny: vec![],
             })],
@@ -2412,6 +2599,96 @@ mod tests {
             payloads.is_empty(),
             "SourceAccount must not fire when source_account is None"
         );
+    }
+
+    // ── Issue #250: SourceAccount mode="not_in" and alert_unless ─────────────
+
+    #[test]
+    fn source_account_mode_not_in_fires_on_unknown_caller() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::NotIn,
+                accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "SourceAccount");
+    }
+
+    #[test]
+    fn source_account_mode_not_in_does_not_fire_on_known_caller() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::NotIn,
+                accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn source_account_mode_not_in_does_not_fire_when_source_is_missing() {
+        let tx = make_tx(true, &[], None); // source_account = None
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::NotIn,
+                accounts: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "SourceAccount with mode=not_in must not fire when source_account is None"
+        );
+    }
+
+    #[test]
+    fn source_account_alert_unless_fires_on_unknown_caller() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::NotIn,
+                accounts: vec![],
+                alert_unless: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+    }
+
+    #[test]
+    fn source_account_alert_unless_does_not_fire_on_known_caller() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::NotIn,
+                accounts: vec![],
+                alert_unless: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(payloads.is_empty());
     }
 
     #[test]
@@ -2552,6 +2829,7 @@ mod prop_tests {
             let rule = AlertRule::LargeTransfer {
                 threshold_xlm,
                 threshold_stroops: threshold_xlm.saturating_mul(10_000_000),
+                direction: "any".into(),
             };
             let payloads = eval_one(rule, &tx);
             let threshold_stroops = threshold_xlm.saturating_mul(10_000_000);
@@ -2574,6 +2852,7 @@ mod prop_tests {
             let rule = AlertRule::LargeTransfer {
                 threshold_xlm,
                 threshold_stroops: threshold_xlm.saturating_mul(10_000_000),
+                direction: "any".into(),
             };
             // Must not panic regardless of inputs.
             let _ = eval_one(rule, &tx);
@@ -2604,7 +2883,7 @@ mod prop_tests {
             let rules = vec![
                 AlertRule::AnyTransaction,
                 AlertRule::TransactionFailed,
-                AlertRule::LargeTransfer { threshold_xlm: 1, threshold_stroops: 0 },
+                AlertRule::LargeTransfer { threshold_xlm: 1, threshold_stroops: 0, direction: "any".into() },
                 AlertRule::HighFee { threshold_stroops: 1, threshold_xlm: None },
             ];
             let ctx = EvalContext {
@@ -2665,7 +2944,12 @@ mod no_activity_tests {
             p.transaction_hash.is_empty(),
             "synthetic payload has empty hash"
         );
-        assert_eq!(state, NoActivityState::Alerting);
+        match &state {
+            NoActivityState::Alerting { incident_alert_id } => {
+                assert_eq!(incident_alert_id, &p.alert_id);
+            }
+            _ => panic!("expected Alerting state"),
+        }
     }
 
     #[test]
@@ -2704,7 +2988,9 @@ mod no_activity_tests {
         let contract = ctx();
         let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
-        let mut state = NoActivityState::Alerting;
+        let mut state = NoActivityState::Alerting {
+            incident_alert_id: "prev_incident".into(),
+        };
 
         // Still quiet — already alerting, so no second payload.
         let last_seen = ts(12, 0);
@@ -2715,7 +3001,12 @@ mod no_activity_tests {
             payload.is_none(),
             "should not re-fire while already alerting"
         );
-        assert_eq!(state, NoActivityState::Alerting);
+        assert_eq!(
+            state,
+            NoActivityState::Alerting {
+                incident_alert_id: "prev_incident".into()
+            }
+        );
     }
 
     #[test]
@@ -2723,7 +3014,14 @@ mod no_activity_tests {
         let contract = ctx();
         let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
-        let mut state = NoActivityState::Alerting;
+        let incident_id = alert_id(
+            eval_ctx.contract_id,
+            &ts(12, 0).timestamp().to_string(),
+            "NoActivity(5min)",
+        );
+        let mut state = NoActivityState::Alerting {
+            incident_alert_id: incident_id.clone(),
+        };
 
         // Activity just happened (1 minute ago) while we were in Alerting state.
         let last_seen = ts(12, 10);
@@ -2737,6 +3035,75 @@ mod no_activity_tests {
         let p = payload.unwrap();
         assert!(p.resolved, "recovery payload must have resolved=true");
         assert_eq!(p.rule_type, "NoActivity");
+        assert_eq!(
+            p.alert_id, incident_id,
+            "recovery alert_id must match incident alert_id"
+        );
+        assert_eq!(state, NoActivityState::Active);
+    }
+
+    #[test]
+    fn no_activity_consecutive_incidents_have_different_alert_ids() {
+        let contract = ctx();
+        let eval_ctx = contract;
+        let rule = AlertRule::NoActivity { minutes: 5 };
+        let mut state = NoActivityState::default();
+
+        // 1. Incident 1: quiet at 12:06
+        let last_seen_1 = ts(12, 0);
+        let now_1 = ts(12, 6);
+        let payload_1 =
+            check_no_activity(&rule, Some(last_seen_1), now_1, &mut state, &eval_ctx).unwrap();
+        assert!(!payload_1.resolved);
+        let incident_id_1 = payload_1.alert_id.clone();
+        assert_eq!(
+            state,
+            NoActivityState::Alerting {
+                incident_alert_id: incident_id_1.clone(),
+            }
+        );
+
+        // 2. Recovery 1: activity resumes at 12:10, polled at 12:11
+        let last_seen_2 = ts(12, 10);
+        let now_2 = ts(12, 11);
+        let recovery_1 =
+            check_no_activity(&rule, Some(last_seen_2), now_2, &mut state, &eval_ctx).unwrap();
+        assert!(recovery_1.resolved);
+        assert_eq!(
+            recovery_1.alert_id, incident_id_1,
+            "recovery alert_id matches incident alert_id"
+        );
+        assert_eq!(state, NoActivityState::Active);
+
+        // 3. Incident 2: quiet again at 12:20
+        let now_3 = ts(12, 20);
+        let payload_2 =
+            check_no_activity(&rule, Some(last_seen_2), now_3, &mut state, &eval_ctx).unwrap();
+        assert!(!payload_2.resolved);
+        let incident_id_2 = payload_2.alert_id.clone();
+        assert_eq!(
+            state,
+            NoActivityState::Alerting {
+                incident_alert_id: incident_id_2.clone(),
+            }
+        );
+
+        // Consecutive incidents have distinct IDs
+        assert_ne!(
+            incident_id_1, incident_id_2,
+            "consecutive incidents must have different alert IDs"
+        );
+
+        // 4. Recovery 2: activity resumes at 12:25, polled at 12:26
+        let last_seen_3 = ts(12, 25);
+        let now_4 = ts(12, 26);
+        let recovery_2 =
+            check_no_activity(&rule, Some(last_seen_3), now_4, &mut state, &eval_ctx).unwrap();
+        assert!(recovery_2.resolved);
+        assert_eq!(
+            recovery_2.alert_id, incident_id_2,
+            "recovery 2 alert_id matches incident 2 alert_id"
+        );
         assert_eq!(state, NoActivityState::Active);
     }
 
@@ -2765,6 +3132,7 @@ mod no_activity_tests {
 #[allow(clippy::unwrap_used)]
 mod suppressor_tests {
     use super::*;
+    use txwatch_config::RuleEntry;
 
     #[test]
     fn first_warning_is_always_emitted() {
@@ -2969,7 +3337,20 @@ mod suppressor_tests {
         }
     }
 
-    fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
+    fn entry(r: AlertRule) -> RuleEntry {
+        RuleEntry {
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
+            rule: r,
+        }
+    }
+
+    fn run<R: AsRef<AlertRule> + RuleOverrides>(
+        rules: &[R],
+        tx: &EnrichedTransaction,
+    ) -> Vec<AlertPayload> {
         let ctx = EvalContext {
             label: "Label",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
@@ -3198,7 +3579,10 @@ mod suppressor_tests {
         assert!(!topic_value_matches(&vec_val, "1"));
         // Typed patterns (#263).
         assert!(topic_value_matches(&serde_json::json!({"u32": 5}), "u32:5"));
-        assert!(!topic_value_matches(&serde_json::json!({"u32": 5}), "i32:5"));
+        assert!(!topic_value_matches(
+            &serde_json::json!({"u32": 5}),
+            "i32:5"
+        ));
         assert!(topic_value_matches(
             &serde_json::json!({"address": "GABC"}),
             "address:GABC"
@@ -3239,6 +3623,7 @@ mod suppressor_tests {
         RuleConfig {
             rule,
             cooldown_seconds: Some(cooldown),
+            cooldown_summary: false,
         }
     }
 
@@ -3320,5 +3705,90 @@ mod suppressor_tests {
         assert_eq!(tracker.check("CA", "AnyTransaction", 60, now), Some(0));
         assert_eq!(tracker.check("CB", "AnyTransaction", 60, now), Some(0));
         assert_eq!(tracker.check("CA", "AnyTransaction", 60, now), None);
+    }
+
+    fn ctx() -> EvalContext<'static> {
+        EvalContext {
+            label: "Oracle",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
+        }
+    }
+
+    #[test]
+    fn cooldown_summary_emitted_when_window_expires_with_suppressed_matches() {
+        let rule_cfg = RuleConfig {
+            rule: AlertRule::AnyTransaction,
+            cooldown_seconds: Some(60),
+            cooldown_summary: true,
+        };
+        let rules = vec![rule_cfg];
+        let mut tracker = CooldownTracker::new();
+        let mut clock = TestClock::start();
+        let contract = ctx();
+        let eval_ctx = contract;
+
+        // 1. Initial fire
+        let first = fire(&mut tracker, &rules, &clock);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].suppressed_count, 0);
+
+        // 2. Burst of 5 suppressed matches inside the window
+        for _ in 0..5 {
+            clock.advance(5);
+            assert!(fire(&mut tracker, &rules, &clock).is_empty());
+        }
+
+        // Before window expires, check_summaries returns empty
+        assert!(tracker
+            .check_summaries(&rules, &eval_ctx, clock.now())
+            .is_empty());
+
+        // 3. Advance clock past the cooldown window (total 65s > 60s)
+        clock.advance(40);
+
+        // Burst ended, no new transactions. check_summaries should emit a summary alert!
+        let summaries = tracker.check_summaries(&rules, &eval_ctx, clock.now());
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.rule_type, "AnyTransaction");
+        assert_eq!(s.suppressed_count, 5);
+        assert!(
+            s.transaction_hash.is_empty(),
+            "summary alert has no transaction"
+        );
+        assert!(!s.resolved);
+
+        // Calling check_summaries again without new suppressed matches should return empty
+        assert!(tracker
+            .check_summaries(&rules, &eval_ctx, clock.now())
+            .is_empty());
+    }
+
+    #[test]
+    fn cooldown_summary_not_emitted_when_opted_out() {
+        let rule_cfg = RuleConfig {
+            rule: AlertRule::AnyTransaction,
+            cooldown_seconds: Some(60),
+            cooldown_summary: false,
+        };
+        let rules = vec![rule_cfg];
+        let mut tracker = CooldownTracker::new();
+        let mut clock = TestClock::start();
+        let contract = ctx();
+        let eval_ctx = contract;
+
+        let first = fire(&mut tracker, &rules, &clock);
+        assert_eq!(first.len(), 1);
+
+        clock.advance(10);
+        assert!(fire(&mut tracker, &rules, &clock).is_empty());
+
+        clock.advance(60);
+        assert!(tracker
+            .check_summaries(&rules, &eval_ctx, clock.now())
+            .is_empty());
     }
 }

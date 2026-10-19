@@ -60,12 +60,15 @@ pub fn render_batch_body(
         WebhookFormat::Slack => slack_digest(payloads),
         WebhookFormat::Discord => discord_digest(payloads),
         WebhookFormat::Pagerduty => {
-            let key = routing_key
-                .ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?;
+            let key =
+                routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?;
             Value::Array(payloads.iter().map(|p| pagerduty(p, key)).collect())
         }
+        WebhookFormat::Template => serde_json::to_value(payloads)?,
     };
     Ok(serde_json::to_string(&body)?)
+}
+
 /// Renders a user-defined body template. Every [`AlertPayload`] field is a
 /// variable, and values are JSON-escaped, so `{"text": {{ label }}}` yields
 /// `{"text": "My Contract"}`. The engine is sandboxed: no file or network access.
@@ -98,7 +101,7 @@ fn trim_decimal(amount: &str) -> String {
 }
 
 /// Optional detail lines as (name, value) pairs, in display order.
-fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
+pub fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
     let mut details = Vec::new();
     if let Some(xlm) = p.amount_xlm_decimal.as_deref() {
         details.push(("Amount", format!("{} XLM", trim_decimal(xlm))));
@@ -367,6 +370,7 @@ mod tests {
     /// A LargeTransfer alert whose label needs escaping in Slack mrkdwn.
     fn fixture() -> AlertPayload {
         AlertPayload {
+            schema_version: 1,
             alert_id: "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e".into(),
             label: "Escrow <main> & co".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
@@ -382,16 +386,29 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
+            amount_stroops: None,
+            amount_xlm_decimal: None,
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            severity: None,
+            ledger: None,
+            source_account: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            resolved: false,
+            matched_events: vec![],
+            suppressed_count: 0,
+            test: false,
+            old_wasm_hash: None,
+            new_wasm_hash: None,
+            enrichment_incomplete: false,
         }
     }
 
     fn render(format: WebhookFormat, payload: &AlertPayload) -> Value {
         serde_json::from_str(&render_body(format, payload, Some("R0UT1NGKEY"), None).unwrap())
             .unwrap()
-    }
-
-    fn snapshot(expected: &str) -> Value {
-        serde_json::from_str(expected).expect("snapshot is valid JSON")
     }
 
     #[test]
@@ -435,6 +452,9 @@ mod tests {
     fn pagerduty_batch_requires_routing_key() {
         let payloads = vec![fixture()];
         assert!(render_batch_body(WebhookFormat::Pagerduty, &payloads, None).is_err());
+    }
+
+    #[test]
     fn optional_details_are_omitted_when_absent() {
         let mut p = fixture();
         p.amount_xlm = None;

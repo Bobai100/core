@@ -114,12 +114,15 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
   [[contracts.rules]]
   type = "TransactionFailed"
 
-  # SourceAccount rule: alert when called by anyone except the known admin
+  # SourceAccount allowlist: alert when called by anyone except the known admin.
+  # mode = "not_in" fires when the caller is NOT in accounts, and never fires
+  # when the transaction has no source account.
   [[contracts.rules]]
   type = "All"
   [[contracts.rules.rules]]
-  type  = "SourceAccount"
-  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
+  type     = "SourceAccount"
+  mode     = "not_in"
+  accounts = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
   severity = "warning"
 
   # Composite rule: alert only when withdraw is called AND amount is large

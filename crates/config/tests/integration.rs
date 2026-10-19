@@ -67,6 +67,8 @@ fn invalid_syntax_toml_fixture_reports_file_path() {
         "expected the error to include the file path, got: {}",
         msg
     );
+}
+
 fn write_temp_config(name: &str, contents: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "txwatch-config-it-{}-{}",

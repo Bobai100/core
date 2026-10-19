@@ -652,7 +652,10 @@ fn validate_json_with_check_webhooks_produces_valid_json() {
     let checks = json["webhook_checks"].as_array().unwrap();
     assert_eq!(checks.len(), 1, "one webhook destination → one check entry");
     assert!(checks[0].get("url").is_some(), "each check must have a url");
-    assert!(checks[0].get("ok").is_some(), "each check must have an ok field");
+    assert!(
+        checks[0].get("ok").is_some(),
+        "each check must have an ok field"
+    );
 }
 
 #[test]
@@ -724,8 +727,7 @@ fn validate_json_format_does_not_conflict_with_check_flags() {
     );
     // Output must be valid JSON.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout must be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
     assert!(json.get("valid").is_some());
     assert!(json.get("webhook_checks").is_some());
     assert!(json.get("horizon_checks").is_some());
