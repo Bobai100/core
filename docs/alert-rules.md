@@ -293,29 +293,33 @@ threshold_xlm = 1
 
 ### `SourceAccount`
 
-| Field   | Type       | Required | Description |
-|---------|------------|----------|-------------|
-| `allow` | [G-address] | no      | If set, only fire when the transaction source account is one of these addresses. |
-| `deny`  | [G-address] | no      | If set, fire when the transaction source account is one of these addresses. |
+| Field          | Type         | Required | Description |
+|----------------|--------------|----------|-------------|
+| `mode`         | string       | no       | `"in"` (default) to fire when source is in `accounts`; `"not_in"` to fire when source is not in `accounts`. |
+| `accounts`     | [G-address]  | no       | List of Stellar G-addresses to match against. |
+| `alert_unless` | [G-address]  | no       | Convenience alias: sets `accounts` and defaults `mode` to `"not_in"`. |
+| `allow`        | [G-address]  | no       | *(Deprecated)* Legacy membership list. Use `mode = "in"` with `accounts`. |
+| `deny`         | [G-address]  | no       | *(Deprecated)* Legacy membership list. Use `mode = "not_in"` with `accounts`. |
 
-At least one of `allow` or `deny` must be non-empty. Each address must be a valid 56-character Stellar G-address.
-
-Matches when the transaction `source_account` satisfies both:
-- It is in `allow` (if `allow` is non-empty), **and**
-- It is not in `deny` (if `deny` is non-empty).
-
-**Use case:** alert when an admin function is called by an unexpected account, or watch a specific counterparty.
+> **Migration Note:** The legacy `allow` and `deny` fields are deprecated. Previously, both `allow` and `deny` fired on membership, which was counter-intuitive for users wanting to alert on unknown callers. To alert when the caller is *not* on an allowlist, use `mode = "not_in"` with `accounts = [...]` (or `alert_unless = [...]`). This also prevents false alerts on missing transaction source accounts.
 
 ```toml
-# Fire only when called by the known multisig
+# Alert on any caller EXCEPT the approved admin (allowlist use case)
 [[contracts.rules]]
-type  = "SourceAccount"
-allow = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+type     = "SourceAccount"
+mode     = "not_in"
+accounts = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
 
-# Fire when called by any account except the approved bot
+# Or equivalently using alert_unless:
 [[contracts.rules]]
-type = "SourceAccount"
-deny = ["GBUKOFF2GVFNQRJFGHVGON2JKGB4VBUF2QQJFNJ6HQVTJRZTCGQX7ZR"]
+type         = "SourceAccount"
+alert_unless = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
+
+# Alert only when called by a specific known account
+[[contracts.rules]]
+type     = "SourceAccount"
+mode     = "in"
+accounts = ["GBUKOFF2GVFNQRJFGHVGON2JKGB4VBUF2QQJFNJ6HQVTJRZTCGQX7ZRA"]
 ```
 
 The `source_account` field is included in the alert payload when this rule fires (and whenever `source_account` is present in the Horizon response).

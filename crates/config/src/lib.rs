@@ -337,6 +337,30 @@ pub enum FunctionMatchMode {
     Glob,
 }
 
+/// Mode for `SourceAccount` rule matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAccountMode {
+    #[default]
+    In,
+    NotIn,
+}
+
+fn default_transfer_direction() -> String {
+    "any".to_string()
+}
+
+/// A matcher on event data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct DataMatcher {
+    #[serde(default)]
+    pub pointer: String,
+    #[serde(default)]
+    pub op: String,
+    #[serde(default)]
+    pub value: String,
+}
+
 /// Maximum number of argument matchers on a `FunctionCalled` rule.
 pub const MAX_FUNCTION_ARGS: usize = 16;
 
@@ -366,13 +390,17 @@ const MEMO_TYPES: &[&str] = &["none", "text", "id", "hash", "return"];
 
 /// Unknown keys in a rule table are rejected (e.g. `threshold_xml` on a
 /// `HighFee` rule, or `function_name` on an `AnyTransaction` rule).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum AlertRule {
     AnyTransaction,
     TransactionFailed,
+    #[serde(rename = "LargeTransfer", alias = "large_transfer")]
     LargeTransfer {
         threshold_xlm: u64,
+        #[serde(default = "default_transfer_direction")]
+        #[schemars(default)]
+        direction: String,
         /// Pre-computed stroops value set during validation (`threshold_xlm * 10_000_000`).
         /// Skipped in serialisation so it does not appear in TOML or JSON config output.
         #[serde(skip)]
@@ -404,11 +432,19 @@ pub enum AlertRule {
         threshold_xlm: Option<u64>,
     },
     /// Fires when the transaction source account is in (or not in) a list of G-addresses.
+    #[serde(rename = "SourceAccount", alias = "source_account")]
     SourceAccount {
-        /// If set, only fire when `source_account` is one of these addresses.
+        #[serde(default)]
+        #[schemars(default)]
+        mode: SourceAccountMode,
+        #[serde(default, alias = "addresses")]
+        accounts: Vec<String>,
+        #[serde(default)]
+        alert_unless: Vec<String>,
+        /// Deprecated: use `accounts` with `mode = "in"`.
         #[serde(default)]
         allow: Vec<String>,
-        /// If set, fire when `source_account` is one of these addresses.
+        /// Deprecated: use `accounts` with `mode = "not_in"`.
         #[serde(default)]
         deny: Vec<String>,
     },
@@ -434,11 +470,16 @@ pub enum AlertRule {
     /// topic is the symbol `topic` (e.g. `transfer`, `mint`, `admin_changed`).
     /// `topics` optionally constrains the following topics positionally
     /// (`topics[0]` matches event topic 1, and so on); `"*"` matches anything.
+    #[serde(rename = "EventEmitted", alias = "event_emitted")]
     EventEmitted {
         topic: String,
         #[serde(default)]
         topics: Vec<String>,
+        #[serde(default)]
+        data: Vec<DataMatcher>,
     },
+    #[serde(rename = "ContractUpgraded", alias = "contract_upgraded")]
+    ContractUpgraded,
     /// Fires when the nested rule matches at least `count` times within a
     /// sliding `window_seconds` window (issue #267). Emits one alert per
     /// breach with the observed count.
@@ -461,7 +502,7 @@ pub enum AlertRule {
 }
 
 /// A rule entry with optional per-rule overrides.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct RuleEntry {
     /// Set `enabled = false` to silence a rule without removing it.
     #[serde(default = "default_true")]
@@ -479,15 +520,34 @@ pub struct RuleEntry {
     pub rule: AlertRule,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TopicOrTopics {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
 /// Deserialization mirror of [`AlertRule`]. serde ignores extra keys on unit
 /// variants of an internally tagged enum even with `deny_unknown_fields`, so
 /// every variant here is a struct variant and unknown keys are rejected.
 #[derive(Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 enum AlertRuleRepr {
+    #[serde(rename = "AnyTransaction", alias = "any_transaction")]
     AnyTransaction {},
+    #[serde(rename = "TransactionFailed", alias = "transaction_failed")]
     TransactionFailed {},
+    #[serde(rename = "LargeTransfer", alias = "large_transfer")]
     LargeTransfer {
+        threshold_xlm: u64,
+        #[serde(default = "default_transfer_direction")]
+        direction: String,
+    },
+    #[serde(rename = "FunctionCalled", alias = "function_called")]
+    FunctionCalled { function_name: String },
+    #[serde(rename = "AdminFunctionCalled", alias = "admin_function_called")]
+    AdminFunctionCalled { function_names: Vec<String> },
+    #[serde(rename = "HighFee", alias = "high_fee")]
         #[serde(default)]
         threshold_xlm: Option<u64>,
         #[serde(default)]
@@ -509,29 +569,38 @@ enum AlertRuleRepr {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    #[serde(rename = "SourceAccount", alias = "source_account")]
     SourceAccount {
+        #[serde(default)]
+        mode: SourceAccountMode,
+        #[serde(default, alias = "addresses")]
+        accounts: Vec<String>,
+        #[serde(default)]
+        alert_unless: Vec<String>,
         #[serde(default)]
         allow: Vec<String>,
         #[serde(default)]
         deny: Vec<String>,
     },
-    All {
-        rules: Vec<RuleEntry>,
-    },
-    Any {
-        rules: Vec<RuleEntry>,
-    },
-    Not {
-        rule: Box<RuleEntry>,
-    },
-    NoActivity {
-        minutes: u32,
-    },
+    #[serde(rename = "All", alias = "all")]
+    All { rules: Vec<RuleEntry> },
+    #[serde(rename = "Any", alias = "any")]
+    Any { rules: Vec<RuleEntry> },
+    #[serde(rename = "Not", alias = "not")]
+    Not { rule: Box<RuleEntry> },
+    #[serde(rename = "NoActivity", alias = "no_activity")]
+    NoActivity { minutes: u32 },
+    #[serde(rename = "EventEmitted", alias = "event_emitted")]
     EventEmitted {
-        topic: String,
+        #[serde(default)]
+        topic: Option<TopicOrTopics>,
         #[serde(default)]
         topics: Vec<String>,
+        #[serde(default)]
+        data: Vec<DataMatcher>,
     },
+    #[serde(rename = "ContractUpgraded", alias = "contract_upgraded")]
+    ContractUpgraded {},
     Rate {
         rule: Box<RuleEntry>,
         count: u64,
@@ -554,6 +623,12 @@ impl<'de> Deserialize<'de> for AlertRule {
             AlertRuleRepr::TransactionFailed {} => AlertRule::TransactionFailed,
             AlertRuleRepr::LargeTransfer {
                 threshold_xlm,
+                direction,
+            } => AlertRule::LargeTransfer {
+                threshold_xlm,
+                direction,
+                // Filled in by `validate`.
+                threshold_stroops: 0,
                 threshold_stroops,
             } => {
                 // #240: Accept either threshold_xlm or threshold_stroops
@@ -595,16 +670,47 @@ impl<'de> Deserialize<'de> for AlertRule {
                 threshold_stroops,
                 threshold_xlm,
             },
-            AlertRuleRepr::SourceAccount { allow, deny } => {
-                AlertRule::SourceAccount { allow, deny }
-            }
+            AlertRuleRepr::SourceAccount {
+                mode,
+                accounts,
+                alert_unless,
+                allow,
+                deny,
+            } => AlertRule::SourceAccount {
+                mode,
+                accounts,
+                alert_unless,
+                allow,
+                deny,
+            },
             AlertRuleRepr::All { rules } => AlertRule::All { rules },
             AlertRuleRepr::Any { rules } => AlertRule::Any { rules },
             AlertRuleRepr::Not { rule } => AlertRule::Not { rule },
             AlertRuleRepr::NoActivity { minutes } => AlertRule::NoActivity { minutes },
-            AlertRuleRepr::EventEmitted { topic, topics } => {
-                AlertRule::EventEmitted { topic, topics }
+            AlertRuleRepr::EventEmitted {
+                topic,
+                mut topics,
+                data,
+            } => {
+                let first_topic = match topic {
+                    Some(TopicOrTopics::Single(s)) => s,
+                    Some(TopicOrTopics::Multiple(v)) => {
+                        if !v.is_empty() {
+                            topics.splice(0..0, v[1..].iter().cloned());
+                            v[0].clone()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    None => String::new(),
+                };
+                AlertRule::EventEmitted {
+                    topic: first_topic,
+                    topics,
+                    data,
+                }
             }
+            AlertRuleRepr::ContractUpgraded {} => AlertRule::ContractUpgraded,
             AlertRuleRepr::Rate {
                 rule,
                 count,
@@ -644,7 +750,15 @@ impl AlertRule {
             AlertRule::LargeTransfer {
                 threshold_xlm,
                 threshold_stroops,
+                direction,
             } => {
+                if !["in", "out", "any"].contains(&direction.as_str()) {
+                    bail!(
+                        "contract '{}': LargeTransfer direction must be one of 'in', 'out', 'any', got '{}'",
+                        contract_label,
+                        direction
+                    );
+                }
                 if *threshold_xlm == 0 {
                     bail!(
                         "contract '{}': LargeTransfer threshold_xlm must be > 0",
@@ -787,12 +901,32 @@ impl AlertRule {
                 }
                 _ => {}
             },
-            AlertRule::SourceAccount { allow, deny } => {
-                if allow.is_empty() && deny.is_empty() {
+            AlertRule::SourceAccount {
+                mode,
+                accounts,
+                alert_unless,
+                allow,
+                deny,
+            } => {
+                if !alert_unless.is_empty() && accounts.is_empty() {
+                    *accounts = alert_unless.clone();
+                    *mode = SourceAccountMode::NotIn;
+                }
+                if accounts.is_empty() && allow.is_empty() && deny.is_empty() {
                     bail!(
-                        "contract '{}': SourceAccount: at least one of 'allow' or 'deny' must be non-empty",
+                        "contract '{}': SourceAccount: at least one address must be specified in 'accounts' (or deprecated 'allow'/'deny')",
                         contract_label
                     );
+                }
+                for addr in accounts.iter() {
+                    validate_stellar_address(addr, "SourceAccount accounts entry", contract_label)?;
+                }
+                for addr in alert_unless.iter() {
+                    validate_stellar_address(
+                        addr,
+                        "SourceAccount alert_unless entry",
+                        contract_label,
+                    )?;
                 }
                 for addr in allow.iter() {
                     validate_stellar_address(addr, "SourceAccount allow entry", contract_label)?;
@@ -840,21 +974,16 @@ impl AlertRule {
                     );
                 }
             }
-            AlertRule::EventEmitted { topic, topics } => {
+            AlertRule::EventEmitted {
+                topic,
+                topics,
+                data,
+            } => {
                 *topic = topic.trim().to_owned();
                 if topic.is_empty() {
                     bail!(
                         "contract '{}': EventEmitted topic must not be empty",
                         contract_label
-                    );
-                }
-                if !is_soroban_symbol(topic) {
-                    bail!(
-                        "contract '{}': EventEmitted topic {:?} is not a valid Soroban symbol \
-                         (at most {} characters from [a-zA-Z0-9_])",
-                        contract_label,
-                        topic,
-                        MAX_SOROBAN_SYMBOL_LEN
                     );
                 }
                 for t in topics.iter_mut() {
@@ -868,7 +997,35 @@ impl AlertRule {
                         );
                     }
                 }
+                for matcher in data.iter() {
+                    if !matcher.pointer.is_empty() && !matcher.pointer.starts_with('/') {
+                        bail!(
+                            "contract '{}': EventEmitted data matcher pointer must start with '/' or be empty, got '{}'",
+                            contract_label,
+                            matcher.pointer
+                        );
+                    }
+                    if !["eq", "gte", "lte"].contains(&matcher.op.as_str()) {
+                        bail!(
+                            "contract '{}': EventEmitted data matcher op must be one of 'eq', 'gte', 'lte', got '{}'",
+                            contract_label,
+                            matcher.op
+                        );
+                    }
+                    if (matcher.op == "gte" || matcher.op == "lte")
+                        && matcher.value.parse::<i128>().is_err()
+                        && matcher.value.parse::<f64>().is_err()
+                    {
+                        bail!(
+                            "contract '{}': EventEmitted data matcher numeric comparison '{}' requires a number, got '{}'",
+                            contract_label,
+                            matcher.op,
+                            matcher.value
+                        );
+                    }
+                }
             }
+            AlertRule::ContractUpgraded => {}
             AlertRule::Rate {
                 rule,
                 count,
@@ -1008,15 +1165,36 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
-            AlertRule::SourceAccount { allow, deny } => {
-                let mut parts = Vec::new();
-                if !allow.is_empty() {
-                    parts.push(format!("allow=[{}]", allow.join(", ")));
+            AlertRule::SourceAccount {
+                mode,
+                accounts,
+                alert_unless,
+                allow,
+                deny,
+            } => {
+                let list = if !accounts.is_empty() {
+                    accounts
+                } else if !alert_unless.is_empty() {
+                    alert_unless
+                } else {
+                    &Vec::new()
+                };
+                if !list.is_empty() {
+                    let mode_str = match mode {
+                        SourceAccountMode::In => "in",
+                        SourceAccountMode::NotIn => "not_in",
+                    };
+                    format!("SourceAccount({}: [{}])", mode_str, list.join(", "))
+                } else {
+                    let mut parts = Vec::new();
+                    if !allow.is_empty() {
+                        parts.push(format!("allow=[{}]", allow.join(", ")));
+                    }
+                    if !deny.is_empty() {
+                        parts.push(format!("deny=[{}]", deny.join(", ")));
+                    }
+                    format!("SourceAccount({})", parts.join(", "))
                 }
-                if !deny.is_empty() {
-                    parts.push(format!("deny=[{}]", deny.join(", ")));
-                }
-                format!("SourceAccount({})", parts.join(", "))
             }
             AlertRule::All { rules } => {
                 let inner: Vec<String> = rules.iter().map(|e| e.rule.label()).collect();
@@ -1030,6 +1208,8 @@ impl AlertRule {
                 format!("Not({})", rule.rule.label())
             }
             AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
+            AlertRule::EventEmitted { topic, topics, .. } => event_emitted_label(topic, topics),
+            AlertRule::ContractUpgraded => "ContractUpgraded".into(),
             AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
             AlertRule::Rate {
                 rule,
@@ -1074,6 +1254,7 @@ impl AlertRule {
             AlertRule::Not { .. } => "Not",
             AlertRule::NoActivity { .. } => "NoActivity",
             AlertRule::EventEmitted { .. } => "EventEmitted",
+            AlertRule::ContractUpgraded => "ContractUpgraded",
             AlertRule::Rate { .. } => "Rate",
             AlertRule::Memo { .. } => "Memo",
         }
@@ -1128,7 +1309,7 @@ pub fn event_emitted_label(topic: &str, topics: &[String]) -> String {
 
 /// One `[[contracts.rules]]` entry: the rule itself plus per-rule delivery
 /// settings that apply to every rule type.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct RuleConfig {
     #[serde(flatten)]
     pub rule: AlertRule,
@@ -1138,6 +1319,9 @@ pub struct RuleConfig {
     /// the cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_seconds: Option<u64>,
+    /// When true, emit a summary alert if suppressed_count > 0 when the cooldown window expires.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cooldown_summary: bool,
     /// Set `enabled = false` to silence a rule without removing it.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1178,6 +1362,7 @@ impl From<AlertRule> for RuleConfig {
         Self {
             rule,
             cooldown_seconds: None,
+            cooldown_summary: false,
             enabled: true,
             webhook_url: None,
             webhook_secret: None,
@@ -1590,7 +1775,7 @@ impl std::error::Error for ValidationErrors {}
 
 /// Checks that `value` is an http(s) URL with a host; returns a description
 /// of the problem otherwise.
-fn check_http_url(value: &str) -> Option<String> {
+pub fn check_http_url(value: &str) -> Option<String> {
     match Url::parse(value) {
         Err(e) => Some(format!("'{}' is not a valid URL: {}", value, e)),
         Ok(url) if url.scheme() != "http" && url.scheme() != "https" => {
@@ -1981,6 +2166,14 @@ pub struct AppConfig {
     /// continues from the saved cursor on the next cycle. Default: 10.
     #[serde(default)]
     pub max_pages_per_cycle: Option<usize>,
+    /// Maximum number of contracts polled concurrently by `watch --once`.
+    /// Must be between 1 and 256. Default: 8.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// Optional path to a JSON file used to persist state (cursors, cooldowns,
+    /// no-activity tracking) across restarts.
+    #[serde(default)]
+    pub state_file: Option<String>,
     /// How `/readyz` combines per-contract health: `"all"` (default), `"any"`,
     /// or a percentage of enabled contracts such as `"80%"`. A contract is
     /// healthy when it polled successfully within 2 × its effective
@@ -2105,6 +2298,8 @@ fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
+    let deserializer =
+        toml::Deserializer::parse(raw).map_err(|e| anyhow!("{} (in {})", e, path.display()))?;
     // serde_path_to_error::deserialize owns the Track that Deserializer::new
     // otherwise requires, so the field path survives into the error message.
     let deserializer = toml::Deserializer::parse(raw)
@@ -2234,6 +2429,9 @@ impl AppConfig {
     fn resolve_env_vars(&mut self) -> Result<()> {
         if let Some(cursor_file) = &mut self.cursor_file {
             resolve_field(cursor_file, "cursor_file")?;
+        }
+        if let Some(state_file) = &mut self.state_file {
+            resolve_field(state_file, "state_file")?;
         }
         for (i, contract) in self.contracts.iter_mut().enumerate() {
             let field = |name: &str| format!("contracts[{}].{}", i, name);
@@ -2470,9 +2668,23 @@ impl AppConfig {
             .unwrap_or(DEFAULT_MAX_PAGES_PER_CYCLE)
     }
 
+    /// Poll concurrency in force: `concurrency`, else [`DEFAULT_CONCURRENCY`].
+    pub fn effective_concurrency(&self) -> usize {
+        self.concurrency.unwrap_or(DEFAULT_CONCURRENCY)
+    }
+
     /// Validates the whole config and reports every error found, not just the first.
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
+
+        if let Some(concurrency) = self.concurrency {
+            if concurrency == 0 || concurrency > MAX_CONCURRENCY {
+                errors.push(format!(
+                    "concurrency must be between 1 and {}",
+                    MAX_CONCURRENCY
+                ));
+            }
+        }
 
         if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")
         {
@@ -2674,6 +2886,7 @@ mod tests {
         RuleConfig {
             rule: r,
             cooldown_seconds: None,
+            cooldown_summary: false,
         }
     }
 
@@ -2777,6 +2990,7 @@ mod tests {
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::LargeTransfer {
+            direction: "any".into(),
             threshold_xlm: 0,
             threshold_stroops: 0,
         })];
@@ -2788,6 +3002,7 @@ mod tests {
     fn large_transfer_threshold_normalises_to_stroops() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::LargeTransfer {
+            direction: "any".into(),
             threshold_xlm: 10_000,
             threshold_stroops: 0,
         })];
@@ -2809,6 +3024,7 @@ mod tests {
     fn rejects_too_large_large_transfer_threshold() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::LargeTransfer {
+            direction: "any".into(),
             threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
             threshold_stroops: 0,
         })];
@@ -3002,6 +3218,7 @@ mod tests {
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
         bad_rule.rules = vec![rule(AlertRule::LargeTransfer {
+            direction: "any".into(),
             threshold_xlm: 0,
             threshold_stroops: 0,
         })];
@@ -3019,6 +3236,8 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            concurrency: None,
+            state_file: None,
             ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
@@ -3056,6 +3275,8 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            concurrency: None,
+            state_file: None,
             ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
@@ -3074,6 +3295,8 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            concurrency: None,
+            state_file: None,
             ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
@@ -3168,6 +3391,8 @@ mod tests {
                 max_pages_per_cycle: None,
                 readiness_policy: Default::default(),
                 cursor_file: None,
+                concurrency: None,
+                state_file: None,
                 ..Default::default()
             };
             let err = cfg.validate().unwrap_err();
@@ -3208,6 +3433,8 @@ mod tests {
             max_pages_per_cycle: None,
             readiness_policy: Default::default(),
             cursor_file: None,
+            concurrency: None,
+            state_file: None,
             ..Default::default()
         }
     }
@@ -3797,8 +4024,10 @@ mod tests {
             rule: AlertRule::EventEmitted {
                 topic: topic.into(),
                 topics: topics.iter().map(|t| t.to_string()).collect(),
+                data: Vec::new(),
             },
             cooldown_seconds: None,
+            cooldown_summary: false,
         }
     }
 
@@ -3905,6 +4134,7 @@ mod tests {
         c.rules = vec![RuleConfig {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: Some(MAX_COOLDOWN_SECONDS + 1),
+            cooldown_summary: false,
         }];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("cooldown_seconds"), "got: {}", err);
@@ -4171,6 +4401,7 @@ mod tests {
                     webhook_secret: None,
                     severity: None,
                     rule: AlertRule::LargeTransfer {
+                        direction: "any".into(),
                         threshold_xlm: 10_000,
                         threshold_stroops: 0,
                     },
@@ -4189,6 +4420,9 @@ mod tests {
     fn source_account_allow_validates() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
+            mode: SourceAccountMode::In,
+            accounts: vec![],
+            alert_unless: vec![],
             allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
             deny: vec![],
         })];
@@ -4199,6 +4433,9 @@ mod tests {
     fn source_account_deny_validates() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
+            mode: SourceAccountMode::In,
+            accounts: vec![],
+            alert_unless: vec![],
             allow: vec![],
             deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
         })];
@@ -4209,6 +4446,9 @@ mod tests {
     fn source_account_empty_both_is_rejected() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
+            mode: SourceAccountMode::In,
+            accounts: vec![],
+            alert_unless: vec![],
             allow: vec![],
             deny: vec![],
         })];
@@ -4224,6 +4464,9 @@ mod tests {
     fn source_account_invalid_address_is_rejected() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
+            mode: SourceAccountMode::In,
+            accounts: vec![],
+            alert_unless: vec![],
             allow: vec!["NOT_A_STELLAR_ADDR".into()],
             deny: vec![],
         })];

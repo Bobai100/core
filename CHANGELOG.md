@@ -20,12 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI now diffs the output of `txwatch schema` against the committed `docs/txwatch-config.schema.json`, so the committed schema can no longer drift from the code (#201).
 - CI runs `actionlint` over the workflows, catching duplicated or broken steps (#202).
 - CI test matrix now covers `ubuntu-latest`, `macos-latest` and `windows-latest`, including a Windows test that the cursor file is atomically replaced (#203).
+- `SourceAccount` gains an explicit `mode = "in" | "not_in"` with an `accounts` list, plus an `alert_unless` allowlist shorthand. `mode = "not_in"` never fires when the transaction has no source account, so it can safely express "alert on any unknown caller" (#250).
+- `cooldown_summary = true` on a rule emits a summary alert carrying the accumulated `suppressed_count` once the cooldown window expires, so matches suppressed at the end of a burst are reported (#259).
 
 ### Changed
 
 - `evaluate()` now accepts `&EvalContext` and an optional `&WarningSuppressor` instead of five positional string arguments and no suppressor (#59, #60).
 - `WatchedContract::collect_errors` and `AppConfig::validate` now collect all validation errors before returning instead of stopping at the first failure (#60).
 - Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
+- `SourceAccount`'s `allow`/`deny` fields are deprecated in favour of `mode` + `accounts`; both previously fired on list *membership*, which reversed the expected "alert on unknown caller" behaviour (#250).
+- `NoActivity` incidents now carry a unique `alert_id` per incident, and the recovery alert reuses its incident's `alert_id` so the two can be correlated (#254, #255).
 
 ### Removed
 

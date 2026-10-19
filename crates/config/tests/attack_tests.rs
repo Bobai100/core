@@ -11,6 +11,7 @@ fn test_attack_oversized_transfer_threshold_rejected() {
     let mut rule = AlertRule::LargeTransfer {
         threshold_xlm: 2_000_000_000, // Exceeds MAX_LARGE_TRANSFER_THRESHOLD_XLM (1_000_000_000)
         threshold_stroops: 0,         // Filled in by `validate`
+        direction: "any".into(),
     };
     let result = rule.validate("attack-target");
     assert!(
@@ -26,6 +27,7 @@ fn test_attack_zero_threshold_rejected() {
     let mut rule = AlertRule::LargeTransfer {
         threshold_xlm: 0,
         threshold_stroops: 0,
+        direction: "any".into(),
     };
     let result = rule.validate("attack-target");
     assert!(result.is_err(), "Validator must reject zero threshold");
@@ -65,6 +67,7 @@ fn test_attack_contract_address_forgery_rejected() {
         rules: vec![RuleConfig {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: None,
+            cooldown_summary: false,
         }],
         webhook_url: Some("https://example.com/webhook".into()),
         webhook_secret: None,
@@ -94,6 +97,7 @@ fn test_attack_control_character_injection_rejected() {
         rules: vec![RuleConfig {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: None,
+            cooldown_summary: false,
         }],
         webhook_url: Some("https://example.com/webhook".into()),
         webhook_secret: None,

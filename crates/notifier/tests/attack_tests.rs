@@ -198,6 +198,7 @@ fn test_pagerduty_resolve_snapshot() {
     let mut payload = test_payload("PagerDutyRecovery");
     payload.resolved = true;
 
+    let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
     let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
@@ -218,6 +219,7 @@ fn test_pagerduty_severity_overrides_rule_type_heuristic() {
     let mut payload = test_payload("AdminFunctionCalled");
     payload.severity = Some("info".to_string());
 
+    let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
     let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
@@ -233,6 +235,7 @@ fn test_pagerduty_critical_large_transfer() {
     let mut payload = test_payload("LargeTransfer");
     payload.severity = Some("critical".to_string());
 
+    let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
     let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(value["payload"]["severity"], "critical");
@@ -244,6 +247,7 @@ fn test_pagerduty_severity_falls_back_to_rule_type() {
     let mut payload = test_payload("AdminFunctionCalled");
     payload.severity = None;
 
+    let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
     let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
@@ -261,6 +265,11 @@ fn test_chat_formats_render_decimal_amount() {
     payload.amount_xlm = Some(0);
     payload.amount_xlm_decimal = Some("0.9000000".to_string());
 
+    let details: String = txwatch_notifier::format::details(&payload)
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let slack_body = txwatch_notifier::format::slack(&payload).to_string();
     assert!(
         slack_body.contains("0.9 XLM"),
@@ -274,6 +283,11 @@ fn test_chat_formats_render_decimal_amount() {
     payload.amount_xlm = Some(9999);
     payload.amount_xlm_decimal = Some("9999.9900000".to_string());
 
+    let details: String = txwatch_notifier::format::details(&payload)
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let slack_body = txwatch_notifier::format::slack(&payload).to_string();
     assert!(
         slack_body.contains("9999.99 XLM"),

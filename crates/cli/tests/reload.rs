@@ -283,13 +283,6 @@ fn watch_reload_migrates_cursor_file_path() {
 
     wait_for(&lines, "TxWatch polling engine started");
 
-    // Rewrite the config with an extra contract and reload via SIGHUP.
-    fs::write(
-        &path,
-        format!(
-            "poll_interval_seconds = 10\n{}{}",
-            contract("Alpha", ALPHA),
-            contract("Beta", BETA)
     // Change the cursor path and reload.
     fs::write(
         &path,
@@ -302,16 +295,7 @@ fn watch_reload_migrates_cursor_file_path() {
     .unwrap();
     sighup(&child);
     let reloaded = wait_for(&lines, "configuration reloaded");
-    assert!(reloaded.contains("contracts=2"), "{}", reloaded);
-
-    // The override must survive the reload: the reloaded contract must still
-    // point at the sentinel URL rather than the public Horizon.
-    let effective = wait_for(&lines, override_url);
-    assert!(
-        !effective.contains("horizon.stellar.org"),
-        "override dropped on reload: {}",
-        effective
-    );
+    assert!(reloaded.contains("contracts=1"), "{}", reloaded);
     assert!(
         child.try_wait().unwrap().is_none(),
         "watcher must still be running"

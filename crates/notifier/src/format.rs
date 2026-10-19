@@ -64,6 +64,7 @@ pub fn render_batch_body(
                 routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?;
             Value::Array(payloads.iter().map(|p| pagerduty(p, key)).collect())
         }
+        WebhookFormat::Template => serde_json::to_value(payloads)?,
     };
     Ok(serde_json::to_string(&body)?)
 }
@@ -100,7 +101,7 @@ fn trim_decimal(amount: &str) -> String {
 }
 
 /// Optional detail lines as (name, value) pairs, in display order.
-fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
+pub fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
     let mut details = Vec::new();
     if let Some(xlm) = p.amount_xlm_decimal.as_deref() {
         details.push(("Amount", format!("{} XLM", trim_decimal(xlm))));
@@ -389,6 +390,13 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
+            amount_stroops: None,
+            amount_xlm_decimal: None,
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            severity: None,
+            ledger: None,
+            source_account: None,
             effective_webhook_url: None,
             effective_webhook_secret: None,
             ledger: None,
@@ -399,6 +407,9 @@ mod tests {
             matched_events: vec![],
             suppressed_count: 0,
             test: false,
+            old_wasm_hash: None,
+            new_wasm_hash: None,
+            enrichment_incomplete: false,
         }
     }
 

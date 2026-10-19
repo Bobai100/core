@@ -58,7 +58,7 @@ pub use metrics::serve_metrics;
 // ── Horizon response shapes ───────────────────────────────────────────────────
 
 /// Horizon operation record — we only need the fields relevant to Soroban.
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Clone)]
 struct HorizonOperation {
     #[serde(rename = "type")]
     op_type: String,
@@ -108,7 +108,7 @@ struct HorizonOperation {
 }
 
 /// One `{"type": ..., "value": ...}` entry of an operation's `parameters` array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct HorizonParameter {
     /// The `ScVal` type name, e.g. `Address`, `Sym`, `U64`, `Bytes`.
     #[serde(rename = "type")]
@@ -193,7 +193,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// One entry of `asset_balance_changes` on an `invoke_host_function` operation.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct AssetBalanceChange {
     #[serde(rename = "type")]
     change_type: String,
@@ -1051,7 +1051,8 @@ impl CycleReport {
 /// `cfg.cursor_file` (if set) and return what happened. Used by
 /// `txwatch watch --once` for cron/CI/scheduler runs.
 pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
-    run_once_with_concurrency(cfg, dry_run, cfg.effective_concurrency()).await
+    let concurrency = cfg.effective_concurrency();
+    run_once_with_concurrency(cfg, dry_run, concurrency).await
 }
 
 /// Like [`run_once`], but polls at most `concurrency` contracts at a time.
@@ -1370,7 +1371,7 @@ impl TransactionSource for HorizonSource<'_> {
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Per-contract mutable state carried across poll cycles.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ContractPollState {
     /// Last transaction timestamp seen for this contract. `None` until the
     /// first transaction is observed.
@@ -1646,7 +1647,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             if ledger.is_some() {
                 state.last_ledger = ledger;
             }
-            let enriched = match EnrichedTransaction::from_horizon(
+            let mut enriched = match EnrichedTransaction::from_horizon(
                 record.tx,
                 details.function_names,
                 amount_stroops,
@@ -1664,13 +1665,26 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             };
             enriched.contract_transfers = details
                 .contract_transfers
-                .iter()
-                .map(|t| (t.direction.to_string(), t.stroops))
+                .into_iter()
+                .map(|t| txwatch_rules::ContractTransfer {
+                    from: if t.direction == "out" {
+                        contract.contract_id.clone()
+                    } else {
+                        String::new()
+                    },
+                    to: if t.direction == "in" {
+                        contract.contract_id.clone()
+                    } else {
+                        String::new()
+                    },
+                    amount_stroops: t.stroops,
+                })
                 .collect();
-            if let Some(upgrade) = details.wasm_upgrade {
-                enriched.old_wasm_hash = upgrade.old_wasm_hash;
-                enriched.new_wasm_hash = upgrade.new_wasm_hash;
-            }
+            enriched.wasm_upgrade = details.wasm_upgrade.map(|u| txwatch_rules::WasmUpgrade {
+                contract_id: contract.contract_id.clone(),
+                old_wasm_hash: u.old_wasm_hash,
+                new_wasm_hash: u.new_wasm_hash,
+            });
 
             // Track the most recent transaction timestamp for NoActivity evaluation.
             state.last_seen = Some(
@@ -1784,6 +1798,22 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             } else {
                 deliver_payload(client, contract, &payload, dry_run, &mut webhook_failures).await;
             }
+        }
+    }
+
+    let summaries = cooldowns.check_summaries(&contract.rules, &eval_ctx, now);
+    for summary in summaries {
+        info!(
+            contract = %contract.label,
+            rule = %summary.rule_triggered,
+            suppressed = summary.suppressed_count,
+            "cooldown expired with suppressed matches — firing summary alert"
+        );
+        alert_count += 1;
+        if contract.batch_alerts {
+            batch.push(summary);
+        } else {
+            deliver_payload(client, contract, &summary, dry_run, &mut webhook_failures).await;
         }
     }
 
@@ -1988,13 +2018,26 @@ pub async fn replay_transaction(
         EnrichedTransaction::from_horizon(tx, details.function_names, amount_stroops, None)?;
     enriched.contract_transfers = details
         .contract_transfers
-        .iter()
-        .map(|t| (t.direction.to_string(), t.stroops))
+        .into_iter()
+        .map(|t| txwatch_rules::ContractTransfer {
+            from: if t.direction == "out" {
+                contract.contract_id.clone()
+            } else {
+                String::new()
+            },
+            to: if t.direction == "in" {
+                contract.contract_id.clone()
+            } else {
+                String::new()
+            },
+            amount_stroops: t.stroops,
+        })
         .collect();
-    if let Some(upgrade) = details.wasm_upgrade {
-        enriched.old_wasm_hash = upgrade.old_wasm_hash;
-        enriched.new_wasm_hash = upgrade.new_wasm_hash;
-    }
+    enriched.wasm_upgrade = details.wasm_upgrade.map(|u| txwatch_rules::WasmUpgrade {
+        contract_id: contract.contract_id.clone(),
+        old_wasm_hash: u.old_wasm_hash,
+        new_wasm_hash: u.new_wasm_hash,
+    });
     if contract.needs_events() {
         let events =
             transaction_events(client, contract, tx_hash, ledger, &mut HashMap::new()).await;
@@ -2369,7 +2412,7 @@ fn horizon_error_body_is_truncated() {
 async fn horizon_response_error(response: reqwest::Response, url: &str) -> anyhow::Error {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    anyhow!(
+    anyhow::anyhow!(
         "Horizon returned HTTP {} for {}: {}",
         status,
         url,
@@ -2859,6 +2902,8 @@ mod tests {
         .expect("recorded fixture is valid JSON");
         let op: HorizonOperation =
             serde_json::from_value(recorded).expect("operation deserialises");
+        let details = extract_soroban_details(vec![op], "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        assert_eq!(details.function_names, vec!["push"]);
         let details = extract_soroban_details(vec![op], TEST_CONTRACT_ID).unwrap();
         assert_eq!(details.function_names, vec!["push"]);
         assert!(details.contract_transfers.is_empty());
@@ -2878,6 +2923,7 @@ mod tests {
             amount: None,
             ..Default::default()
         };
+        let details = extract_soroban_details(vec![op], "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
         let details = extract_soroban_details(vec![op], TEST_CONTRACT_ID).unwrap();
         assert!(details.function_names.is_empty(), "no Sym means no contract function name");
     }

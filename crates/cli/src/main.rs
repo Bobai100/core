@@ -655,11 +655,7 @@ async fn main() -> Result<()> {
 
             // #229: Validate --network before prompting for anything else.
             if let Some(n) = network.as_deref() {
-                if n != "mainnet"
-                    && n != "testnet"
-                    && n != "futurenet"
-                    && horizon_url.is_none()
-                {
+                if n != "mainnet" && n != "testnet" && n != "futurenet" && horizon_url.is_none() {
                     anyhow::bail!(
                         "unknown network '{}'; use mainnet, testnet, futurenet, or pass --horizon-url for a custom network",
                         n
@@ -734,8 +730,7 @@ async fn main() -> Result<()> {
             // replaces an existing file atomically on Unix and on Windows
             // (via MoveFileEx with MOVEFILE_REPLACE_EXISTING).
             let tmp = output.with_extension("toml.tmp");
-            fs::write(&tmp, raw)
-                .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+            fs::write(&tmp, raw).with_context(|| format!("failed to write '{}'", tmp.display()))?;
             fs::rename(&tmp, output).with_context(|| {
                 let _ = fs::remove_file(&tmp);
                 format!("failed to write '{}'", output.display())
@@ -917,9 +912,12 @@ async fn main() -> Result<()> {
 
         Command::PruneCursors { dry_run } => {
             let cfg = load_config(&cli)?;
-            let removed = prune_cursors(&cfg.cursor_file, &cfg, dry_run)?;
+            let Some(cursor_file) = &cfg.cursor_file else {
+                anyhow::bail!("no cursor_file configured in txwatch config");
+            };
+            let removed = prune_cursors(cursor_file, &cfg, dry_run)?;
             if removed.is_empty() {
-                println!("No stale cursor entries found in '{}'.", cfg.cursor_file);
+                println!("No stale cursor entries found in '{}'.", cursor_file);
             } else {
                 let verb = if dry_run { "Would remove" } else { "Removed" };
                 println!(
@@ -927,7 +925,7 @@ async fn main() -> Result<()> {
                     verb,
                     removed.len(),
                     if removed.len() == 1 { "y" } else { "ies" },
-                    cfg.cursor_file
+                    cursor_file
                 );
                 for key in &removed {
                     println!("  - {}", key);
@@ -969,7 +967,7 @@ async fn main() -> Result<()> {
                     concurrency,
                     "running a single TxWatch poll cycle"
                 );
-                let report = txwatch_poller::run_once(cfg, dry_run, concurrency).await?;
+                let report = txwatch_poller::run_once(cfg, dry_run).await?;
                 info!(
                     transactions = report.transactions,
                     alerts = report.alerts,
@@ -1021,8 +1019,7 @@ async fn main() -> Result<()> {
                 concurrency,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_reload(cfg, dry_run, concurrency, shutdown_rx, reload_rx)
-                .await?;
+            txwatch_poller::run_with_reload(cfg, dry_run, shutdown_rx, reload_rx).await?;
         }
     }
 
@@ -1252,7 +1249,9 @@ fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
             };
             if shutting_down {
                 if is_sigint {
-                    error!("second SIGINT received — exiting immediately, state may not be flushed");
+                    error!(
+                        "second SIGINT received — exiting immediately, state may not be flushed"
+                    );
                     std::process::exit(130);
                 }
                 continue;
@@ -1481,8 +1480,8 @@ fn parse_horizon_url(value: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("URL must not be empty".to_string());
     }
-    if let Err(e) = txwatch_config::check_http_url(trimmed) {
-        return Err(format!("invalid URL '{}': {:#}", value, e));
+    if let Some(err) = txwatch_config::check_http_url(trimmed) {
+        return Err(format!("invalid URL '{}': {}", value, err));
     }
     Ok(trimmed.to_string())
 }
