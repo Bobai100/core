@@ -244,7 +244,7 @@ pub fn inc_transactions_skipped(contract: &str, network: &str, n: u64) {
 pub fn inc_alerts(contract: &str, network: &str, n: u64) {
     alerts_total()
         .with_label_values(&[contract, network])
-        .inc();
+        .inc_by(n);
 }
 
 /// Increment `txwatch_alerts_suppressed_total` for a contract's rule type by 1.
@@ -334,6 +334,134 @@ pub fn record_poll_failure(contract: &str, network: &str) {
         .inc();
 }
 
-// ── Readiness ─────────────────────────
+// ── Readiness ─────────────────────────────────────────────────────────────────
 
-/* … truncated 4651 chars — edit only what you need near the top … */
+/// Unix seconds of the last successful contract poll (0 = never).
+static LAST_POLL_SUCCESS: AtomicU64 = AtomicU64::new(0);
+/// Configured poll interval in seconds, used to judge readiness.
+static POLL_INTERVAL_SECS: AtomicU64 = AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record the configured poll interval (called once by the poller at start-up).
+pub fn set_poll_interval(secs: u64) {
+    POLL_INTERVAL_SECS.store(secs, Ordering::Relaxed);
+}
+
+/// Record that a contract poll just succeeded (for readiness).
+pub fn mark_poll_success() {
+    LAST_POLL_SUCCESS.store(now_secs(), Ordering::Relaxed);
+}
+
+/// Ready when a poll succeeded within the last 2 × poll interval.
+fn is_ready() -> bool {
+    let last = LAST_POLL_SUCCESS.load(Ordering::Relaxed);
+    let interval = POLL_INTERVAL_SECS.load(Ordering::Relaxed);
+    if last == 0 || interval == 0 {
+        return false;
+    }
+    now_secs().saturating_sub(last) <= interval.saturating_mul(2)
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
+
+/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
+///
+/// Binds the listener, starts serving on a background task and returns the
+/// address that was actually bound. Callers may pass port `0`, so the returned
+/// address is the one to scrape. Returns an error only if the listener cannot
+/// be bound.
+pub async fn serve_metrics(
+    addr: SocketAddr,
+    shutdown: watch::Receiver<bool>,
+) -> Result<SocketAddr> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind metrics listener on {addr}"))?;
+    // The caller may pass port 0, so hand back what we actually bound.
+    let bound = listener
+        .local_addr()
+        .with_context(|| format!("read local address of metrics listener on {addr}"))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = accept_loop(listener, shutdown).await {
+            tracing::error!(error = %e, "metrics endpoint stopped");
+        }
+    });
+
+    Ok(bound)
+}
+
+async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "metrics accept failed");
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(handle_request);
+                    if let Err(err) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        tracing::debug!(error = %err, "metrics connection error");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_request(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    let response = match (req.method().as_str(), req.uri().path()) {
+        ("GET", "/metrics") => text_response(
+            StatusCode::OK,
+            prometheus::TextEncoder::new()
+                .encode_to_string(&prometheus::gather())
+                .unwrap_or_default(),
+        ),
+        ("GET", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
+        ("GET", "/readyz") => {
+            if is_ready() {
+                text_response(StatusCode::OK, "ready\n".to_string())
+            } else {
+                text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n".to_string())
+            }
+        }
+        ("GET", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
+        _ => text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed\n".to_string(),
+        ),
+    };
+    Ok(response)
+}
+
+fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response
+}

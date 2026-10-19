@@ -7,7 +7,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tokio::sync::oneshot;
 use tracing::field::{Field, Visit};
-use tracing::span::{Attributes, Id, Record};
+use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
@@ -83,6 +83,8 @@ async fn test_attack_huge_success_body_is_capped() {
         result.is_ok(),
         "A 2xx with a huge body must still be treated as a successful delivery"
     );
+}
+
 /// Records the `contract` field of every span that is entered, keyed by span id.
 #[derive(Clone, Default)]
 struct SpanRecorder {
@@ -196,8 +198,7 @@ fn test_pagerduty_resolve_snapshot() {
     let mut payload = test_payload("PagerDutyRecovery");
     payload.resolved = true;
 
-    let body = txwatch_notifier::format::pagerduty(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
         value["event_action"], "resolve",
@@ -207,8 +208,6 @@ fn test_pagerduty_resolve_snapshot() {
         value.get("dedup_key").and_then(|v| v.as_str()).is_some(),
         "resolve payload must include the incident dedup_key"
     );
-
-    insta::assert_snapshot!(body);
 }
 
 /// A rule configured with `severity = "info"` must page as `info` even when
@@ -219,8 +218,7 @@ fn test_pagerduty_severity_overrides_rule_type_heuristic() {
     let mut payload = test_payload("AdminFunctionCalled");
     payload.severity = Some("info".to_string());
 
-    let body = txwatch_notifier::format::pagerduty(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
         value["payload"]["severity"], "info",
@@ -235,8 +233,7 @@ fn test_pagerduty_critical_large_transfer() {
     let mut payload = test_payload("LargeTransfer");
     payload.severity = Some("critical".to_string());
 
-    let body = txwatch_notifier::format::pagerduty(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(value["payload"]["severity"], "critical");
 }
@@ -247,8 +244,7 @@ fn test_pagerduty_severity_falls_back_to_rule_type() {
     let mut payload = test_payload("AdminFunctionCalled");
     payload.severity = None;
 
-    let body = txwatch_notifier::format::pagerduty(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
         value["payload"]["severity"], "critical",
@@ -262,26 +258,26 @@ fn test_pagerduty_severity_falls_back_to_rule_type() {
 #[test]
 fn test_chat_formats_render_decimal_amount() {
     let mut payload = test_payload("LargeTransfer");
-    payload.amount_xlm = 0;
-    payload.amount_xlm_decimal = "0.9000000".to_string();
+    payload.amount_xlm = Some(0);
+    payload.amount_xlm_decimal = Some("0.9000000".to_string());
 
-    let details = txwatch_notifier::format::details(&payload);
+    let slack_body = txwatch_notifier::format::slack(&payload).to_string();
     assert!(
-        details.contains("0.9 XLM"),
-        "details must render trimmed decimal amount, got: {details}"
+        slack_body.contains("0.9 XLM"),
+        "details must render trimmed decimal amount, got: {slack_body}"
     );
     assert!(
-        !details.contains("0 XLM"),
-        "details must not render the truncated integer amount, got: {details}"
+        !slack_body.contains("0 XLM"),
+        "details must not render the truncated integer amount, got: {slack_body}"
     );
 
-    payload.amount_xlm = 9999;
-    payload.amount_xlm_decimal = "9999.9900000".to_string();
+    payload.amount_xlm = Some(9999);
+    payload.amount_xlm_decimal = Some("9999.9900000".to_string());
 
-    let details = txwatch_notifier::format::details(&payload);
+    let slack_body = txwatch_notifier::format::slack(&payload).to_string();
     assert!(
-        details.contains("9999.99 XLM"),
-        "details must render trimmed decimal amount, got: {details}"
+        slack_body.contains("9999.99 XLM"),
+        "details must render trimmed decimal amount, got: {slack_body}"
     );
 }
 

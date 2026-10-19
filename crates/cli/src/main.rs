@@ -82,6 +82,10 @@ enum Command {
         /// Run a single poll cycle, deliver alerts, save cursors and exit
         #[arg(long)]
         once: bool,
+
+        /// Reload configuration when the config file or included files change
+        #[arg(long, env = "TXWATCH_WATCH_CONFIG")]
+        watch_config: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -529,6 +533,7 @@ async fn main() -> Result<()> {
         Command::Watch {
             dry_run,
             once,
+            watch_config,
             #[cfg(feature = "metrics")]
             metrics_addr,
         } => {
@@ -577,7 +582,16 @@ async fn main() -> Result<()> {
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
-            spawn_reload_on_sighup(config_path, reload_tx)?;
+            spawn_reload_on_sighup(
+                config_path.clone(),
+                reload_tx.clone(),
+                cli.horizon_url.clone(),
+            )?;
+
+            let watch_enabled = watch_config || cfg!(windows);
+            if watch_enabled {
+                spawn_config_watcher(config_path, reload_tx, cli.horizon_url.clone());
+            }
 
             info!(
                 version = VERSION,
@@ -657,6 +671,7 @@ fn required_config(path: &Path) -> Result<PathBuf> {
 fn spawn_reload_on_sighup(
     path: PathBuf,
     reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+    horizon_url: Option<String>,
 ) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -664,7 +679,7 @@ fn spawn_reload_on_sighup(
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
             info!(path = %path.display(), "SIGHUP received — reloading config");
-            if let Some(cfg) = reload_config(&path) {
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
                 if reload_tx.send(cfg).await.is_err() {
                     break;
                 }
@@ -678,14 +693,70 @@ fn spawn_reload_on_sighup(
 fn spawn_reload_on_sighup(
     _path: PathBuf,
     _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+    _horizon_url: Option<String>,
 ) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
-fn reload_config(path: &Path) -> Option<AppConfig> {
+/// Watches the configuration file and any included files for changes.
+/// Debounces changes to prevent partial reads and correctly detects
+/// symlink swaps (common in Kubernetes ConfigMap volume mounts).
+fn spawn_config_watcher(
+    path: PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+    horizon_url: Option<String>,
+) {
+    tokio::spawn(async move {
+        let mut last_hash = txwatch_config::compute_config_hash(&path).ok();
+        let poll_interval = Duration::from_millis(250);
+        let debounce_interval = Duration::from_millis(250);
+
+        loop {
+            tokio::time::sleep(poll_interval).await;
+
+            let current_hash = match txwatch_config::compute_config_hash(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if last_hash.as_ref() == Some(&current_hash) {
+                continue;
+            }
+
+            // Debounce: wait until hash is stable across debounce_interval
+            tokio::time::sleep(debounce_interval).await;
+            let debounced_hash = match txwatch_config::compute_config_hash(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if debounced_hash != current_hash {
+                continue;
+            }
+
+            last_hash = Some(debounced_hash);
+            info!(path = %path.display(), "config file change detected — reloading config");
+
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
+                if reload_tx.send(cfg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
-        Ok(cfg) => Some(cfg),
+        Ok(mut cfg) => {
+            if let Some(url) = horizon_url {
+                let url = url.trim_end_matches('/');
+                for c in &mut cfg.contracts {
+                    c.horizon_base_url_override = Some(url.to_string());
+                }
+            }
+            Some(cfg)
+        }
         Err(e) => {
             error!(error = %format!("{:#}", e), "config reload failed — keeping the previous config");
             None
@@ -733,9 +804,6 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "horizon_url": c.network.horizon_base_url(),
                 "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url().unwrap_or(""), c.contract_id),
                 "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
-                "rules": c.rules,
-                "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": c.network.explorer_base_url().map(|e| format!("{}/contract/{}", e, c.contract_id)),
             })
         })
         .collect();

@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Delivery mode for a contract's event feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -170,6 +170,7 @@ pub struct SorobanEventStreamer {
     current_ledger: u64,
     client: Client,
     mode: StreamMode,
+    #[allow(dead_code)]
     consecutive_disconnects: u32,
 }
 
@@ -297,7 +298,11 @@ impl SorobanEventStreamer {
         Err(last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed")))
     }
 
-    async fn try_fetch(&self, url: &str, request_body: &JsonRpcRequest<GetEventsParams>) -> Result<GetEventsResult> {
+    async fn try_fetch(
+        &self,
+        url: &str,
+        request_body: &JsonRpcRequest<GetEventsParams>,
+    ) -> Result<GetEventsResult> {
         let response = self
             .client
             .post(url)
@@ -353,7 +358,11 @@ mod tests {
         })
     }
 
-    fn rpc_result(events: Vec<serde_json::Value>, latest_ledger: u64, cursor: Option<&str>) -> serde_json::Value {
+    fn rpc_result(
+        events: Vec<serde_json::Value>,
+        latest_ledger: u64,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,

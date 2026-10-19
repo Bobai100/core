@@ -58,6 +58,7 @@ async fn mocked_poll_is_reflected_in_metrics_endpoint() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        ..Default::default()
     };
 
     // The endpoint keeps running for the scrape; only the poller is stopped.
@@ -129,6 +130,7 @@ async fn reload_removes_series_of_dropped_contracts() {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            ..Default::default()
         }
     };
 

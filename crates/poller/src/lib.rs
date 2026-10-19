@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
@@ -33,6 +33,15 @@ pub mod plan_cache;
 pub use plan_cache::{PlanCache, PlanStatistics};
 mod poll_health;
 use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
+
+/// Helper to compute jittered backoff delay for an attempt number.
+pub fn backoff_delay(attempt: u32) -> Duration {
+    let mut health = PollHealth::default();
+    for _ in 0..=attempt {
+        health.record_failure();
+    }
+    health.backoff_delay(Duration::from_secs(10))
+}
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
 
@@ -1212,64 +1221,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 contract = %contract.label,
                 "no transaction source can serve this contract; see issue #4"
             );
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
-        // Issue #2: `include_failed=true` is required or Horizon only returns
-        // successful transactions, which makes `TransactionFailed` dead.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations&include_failed=true",
-        // Checked against horizon-testnet.stellar.org: `join=operations` on the
-        // transactions endpoint is NOT supported. Horizon answers 200 but ignores
-        // it and returns no `operations` array (only `join=transactions` exists,
-        // on operation/payment/effect collections). Operations are therefore
-        // fetched per transaction; see `fetch_soroban_details`.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200",
-            poll_base, contract.contract_id, page_cursor
-        );
-
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let response = client.get(&url).send().await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_horizon_request(
-            contract.network.as_str(),
-            started.elapsed().as_secs_f64(),
-        );
-        let response = response.with_context(|| format!("GET {} failed", url))?;
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0, 0));
-        }
-
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "contract not found on {} (404): {}",
-                contract.network.as_str(),
-                truncate_response_body(&body)
-            ));
-        }
-        if !status.is_success() {
-            return Err(horizon_response_error(response, &url).await);
-        }
-
-        let page: HorizonPage = response
-            .json()
-            .await
-            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
-        if records.is_empty() {
             break;
         };
         if page.records.is_empty() {
@@ -2110,7 +2061,7 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use txwatch_config::{AlertRule, Network, RuleConfig};
+    use txwatch_config::{AlertRule, Network, RuleConfig, RuleEntry};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2616,9 +2567,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
-            .respond_with(
-                ResponseTemplate::new(503).set_body_string("operations unavailable"),
-            )
+            .respond_with(ResponseTemplate::new(503).set_body_string("operations unavailable"))
             .mount(&server)
             .await;
 
@@ -2762,12 +2711,16 @@ mod tests {
             webhooks: Vec::new(),
             batch_alerts: false,
         };
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
         let error = poll_contract(
-            &Client::new(),
+            &client,
+            &source,
             &contract,
             &mut HashMap::from([(contract.cursor_key(), "now".into())]),
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            usize::MAX,
             false,
         )
         .await
@@ -2949,6 +2902,7 @@ mod tests {
                     batch_alerts: false,
                 },
             ],
+            ..Default::default()
         };
 
         let (version, contracts_list, networks, horizon_urls) = startup_log_fields(&cfg);
@@ -2991,6 +2945,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            ..Default::default()
         }
     }
 
@@ -3261,6 +3216,114 @@ mod tests {
         let events = transaction_events(&client, &contract, "tx1", None, &mut HashMap::new()).await;
         assert!(events.is_empty());
     }
+
+    #[tokio::test]
+    async fn poll_contract_fetches_events_and_fires_for_nested_event_emitted() {
+        let rpc_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "events": [
+                        rpc_event(100, "nested_tx", "transfer"),
+                    ],
+                    "latestLedger": 200,
+                    "cursor": "c1"
+                }
+            })))
+            .expect(1)
+            .mount(&rpc_server)
+            .await;
+
+        let horizon = MockServer::start().await;
+        let tx_page = serde_json::json!({
+            "_embedded": { "records": [{
+                "hash": "nested_tx",
+                "ledger": 100,
+                "created_at": "2024-06-01T10:00:00Z",
+                "successful": true,
+                "paging_token": "1",
+                "operations": [invoke_op("deposit")]
+            }] }
+        });
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tx_page))
+            .mount(&horizon)
+            .await;
+
+        let webhook = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&webhook)
+            .await;
+
+        let contract = WatchedContract {
+            label: "nested_event_contract".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![rule(AlertRule::All {
+                rules: vec![
+                    RuleEntry {
+                        rule: AlertRule::FunctionCalled {
+                            function_name: "deposit".into(),
+                            match_mode: Default::default(),
+                        },
+                        enabled: true,
+                        webhook_url: None,
+                        webhook_secret: None,
+                        severity: None,
+                    },
+                    RuleEntry {
+                        rule: AlertRule::EventEmitted {
+                            topic: "transfer".into(),
+                            topics: vec![],
+                        },
+                        enabled: true,
+                        webhook_url: None,
+                        webhook_secret: None,
+                        severity: None,
+                    },
+                ],
+            })],
+            webhook_url: Some(webhook.uri()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            soroban_rpc_url: Some(rpc_server.uri()),
+            horizon_base_url_override: Some(horizon.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+            enabled: true,
+        };
+
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
+        let outcome = poll_contract(
+            &client,
+            &source,
+            &contract,
+            &mut HashMap::from([(contract.cursor_key(), "now".into())]),
+            &mut ContractPollState::default(),
+            &mut CooldownTracker::new(),
+            usize::MAX,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.0, 1, "processed 1 transaction");
+        assert_eq!(
+            outcome.1, 1,
+            "fired 1 alert for composite rule with nested EventEmitted"
+        );
+        assert_eq!(outcome.2, 0, "0 poll failures");
+        assert_eq!(outcome.3, 0, "0 webhook failures");
+    }
     // ── Multiple destinations ────────────────────────────────────────────────
 
     /// One alert goes to every destination; a destination that keeps failing
@@ -3318,6 +3381,7 @@ mod tests {
                     format: txwatch_config::WebhookFormat::Txwatch,
                     headers: Default::default(),
                     routing_key: None,
+                    ..Default::default()
                 },
                 WebhookDestination {
                     url: slack.uri(),
@@ -3325,6 +3389,7 @@ mod tests {
                     format: txwatch_config::WebhookFormat::Slack,
                     headers: Default::default(),
                     routing_key: None,
+                    ..Default::default()
                 },
             ],
             enabled: true,
