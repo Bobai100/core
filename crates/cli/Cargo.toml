@@ -23,6 +23,7 @@ metrics = ["txwatch-poller/metrics"]
 txwatch-config   = { path = "../config", version = "0.1.0" }
 txwatch-poller   = { path = "../poller", version = "0.1.0" }
 txwatch-notifier = { path = "../notifier", version = "0.1.0" }
+txwatch-rules    = { path = "../rules", version = "0.1.0" }
 clap             = { workspace = true, features = ["env"] }
 tokio            = { workspace = true, features = ["full"] }
 anyhow           = { workspace = true }
