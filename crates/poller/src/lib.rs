@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
@@ -22,7 +22,7 @@ use txwatch_config::{AppConfig, WatchedContract, WebhookDestination};
 use txwatch_notifier::{send_to_destination, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{
     check_no_activity, evaluate, ContractEvent, CooldownTracker, EnrichedTransaction, EvalContext,
-    HorizonTransaction, NoActivityState, WarningSuppressor,
+    HorizonTransaction, NoActivityState, RateTracker, WarningSuppressor,
 };
 
 pub mod db_snapshot;
@@ -34,10 +34,17 @@ pub use persistence::{
     acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
     StateWriter,
 };
-pub mod plan_cache;
-pub use plan_cache::{PlanCache, PlanStatistics};
 mod poll_health;
 use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
+
+/// Helper to compute jittered backoff delay for an attempt number.
+pub fn backoff_delay(attempt: u32) -> Duration {
+    let mut health = PollHealth::default();
+    for _ in 0..=attempt {
+        health.record_failure();
+    }
+    health.backoff_delay(Duration::from_secs(10))
+}
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
 
@@ -369,7 +376,7 @@ pub async fn run_with_reload(
 
     #[cfg(feature = "metrics")]
     {
-        metrics::set_poll_interval(cfg.poll_interval_seconds);
+        metrics::set_readiness_policy(cfg.readiness_policy);
         metrics::register_build_info();
     }
     let summary_every = Duration::from_secs(60);
@@ -471,6 +478,12 @@ pub async fn run_with_reload(
             }
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
+            #[cfg(feature = "metrics")]
+            metrics::register_contract(
+                &contract.label,
+                contract.network.as_str(),
+                interval.as_secs(),
+            );
             let key = contract.cursor_key();
             // Issue #275: reuse the runtime state of a contract that is still
             // configured with the same rules; only reset it when the rules
@@ -590,7 +603,7 @@ pub async fn run_with_reload(
             .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
         {
-            metrics::set_poll_interval(new_cfg.poll_interval_seconds);
+            metrics::set_readiness_policy(new_cfg.readiness_policy);
             // Drop the series of contracts no longer polled under the same
             // label and network, or freshness alerts would fire for them forever.
             for old in cfg.contracts.iter().filter(|c| c.enabled) {
@@ -762,7 +775,7 @@ async fn poll_contract_forever(
                     metrics::inc_alerts(&contract.label, network, alerts);
                     metrics::inc_transactions_skipped(&contract.label, network, skipped);
                     metrics::record_poll_success(&contract.label, network);
-                    metrics::mark_poll_success();
+                    metrics::mark_poll_success(&contract.label, network, interval.as_secs());
                 }
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
@@ -1358,6 +1371,8 @@ pub struct ContractPollState {
     pub no_activity_states: Vec<NoActivityState>,
     /// Suppresses repeated evaluation warnings for broken rules.
     pub suppressor: WarningSuppressor,
+    /// Sliding-window match counts for `Rate` rules (issue #267).
+    pub rates: RateTracker,
     /// Rule matches dropped by a cooldown in the last poll cycle.
     pub suppressed: u64,
     /// Ledger of the last processed transaction, if Horizon reported one.
@@ -1679,12 +1694,18 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             } else {
                 enriched
             };
-            let payloads = evaluate(
+            let mut payloads = evaluate(
                 &eval_ctx,
                 &contract.rules,
                 &enriched,
                 Some(&state.suppressor),
             );
+            payloads.extend(state.rates.evaluate(
+                &eval_ctx,
+                &contract.rules,
+                &enriched,
+                chrono::Utc::now(),
+            ));
 
             if payloads.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash,
@@ -2524,7 +2545,7 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use txwatch_config::{AlertRule, Network, RuleConfig};
+    use txwatch_config::{AlertRule, Network, RuleConfig, RuleEntry};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2691,6 +2712,7 @@ mod tests {
                 rule: AlertRule::FunctionCalled {
                     function_name: "withdraw".into(),
                     match_mode: Default::default(),
+                    args: vec![],
                 },
                 cooldown_seconds: None,
             }],
@@ -3029,9 +3051,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
-            .respond_with(
-                ResponseTemplate::new(503).set_body_string("operations unavailable"),
-            )
+            .respond_with(ResponseTemplate::new(503).set_body_string("operations unavailable"))
             .mount(&server)
             .await;
 
@@ -3175,12 +3195,16 @@ mod tests {
             webhooks: Vec::new(),
             batch_alerts: false,
         };
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
         let error = poll_contract(
-            &Client::new(),
+            &client,
+            &source,
             &contract,
             &mut HashMap::from([(contract.cursor_key(), "now".into())]),
             &mut ContractPollState::default(),
             &mut CooldownTracker::new(),
+            usize::MAX,
             false,
         )
         .await
@@ -3308,6 +3332,7 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
             contracts: vec![
                 WatchedContract {
@@ -3362,6 +3387,7 @@ mod tests {
                     batch_alerts: false,
                 },
             ],
+            ..Default::default()
         };
 
         let (version, contracts_list, networks, horizon_urls) = startup_log_fields(&cfg);
@@ -3404,6 +3430,8 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -3674,6 +3702,115 @@ mod tests {
         let events = transaction_events(&client, &contract, "tx1", None, &mut HashMap::new()).await;
         assert!(events.is_empty());
     }
+
+    #[tokio::test]
+    async fn poll_contract_fetches_events_and_fires_for_nested_event_emitted() {
+        let rpc_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "events": [
+                        rpc_event(100, "nested_tx", "transfer"),
+                    ],
+                    "latestLedger": 200,
+                    "cursor": "c1"
+                }
+            })))
+            .expect(1)
+            .mount(&rpc_server)
+            .await;
+
+        let horizon = MockServer::start().await;
+        let tx_page = serde_json::json!({
+            "_embedded": { "records": [{
+                "hash": "nested_tx",
+                "ledger": 100,
+                "created_at": "2024-06-01T10:00:00Z",
+                "successful": true,
+                "paging_token": "1",
+                "operations": [invoke_op("deposit")]
+            }] }
+        });
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tx_page))
+            .mount(&horizon)
+            .await;
+
+        let webhook = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&webhook)
+            .await;
+
+        let contract = WatchedContract {
+            label: "nested_event_contract".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![rule(AlertRule::All {
+                rules: vec![
+                    RuleEntry {
+                        rule: AlertRule::FunctionCalled {
+                            function_name: "deposit".into(),
+                            match_mode: Default::default(),
+                            args: vec![],
+                        },
+                        enabled: true,
+                        webhook_url: None,
+                        webhook_secret: None,
+                        severity: None,
+                    },
+                    RuleEntry {
+                        rule: AlertRule::EventEmitted {
+                            topic: "transfer".into(),
+                            topics: vec![],
+                        },
+                        enabled: true,
+                        webhook_url: None,
+                        webhook_secret: None,
+                        severity: None,
+                    },
+                ],
+            })],
+            webhook_url: Some(webhook.uri()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            soroban_rpc_url: Some(rpc_server.uri()),
+            horizon_base_url_override: Some(horizon.uri()),
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+            enabled: true,
+        };
+
+        let client = Client::new();
+        let source = HorizonSource::new(&client, poll_base_url(&contract));
+        let outcome = poll_contract(
+            &client,
+            &source,
+            &contract,
+            &mut HashMap::from([(contract.cursor_key(), "now".into())]),
+            &mut ContractPollState::default(),
+            &mut CooldownTracker::new(),
+            usize::MAX,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.0, 1, "processed 1 transaction");
+        assert_eq!(
+            outcome.1, 1,
+            "fired 1 alert for composite rule with nested EventEmitted"
+        );
+        assert_eq!(outcome.2, 0, "0 poll failures");
+        assert_eq!(outcome.3, 0, "0 webhook failures");
+    }
     // ── Multiple destinations ────────────────────────────────────────────────
 
     /// One alert goes to every destination; a destination that keeps failing
@@ -3731,6 +3868,7 @@ mod tests {
                     format: txwatch_config::WebhookFormat::Txwatch,
                     headers: Default::default(),
                     routing_key: None,
+                    ..Default::default()
                 },
                 WebhookDestination {
                     url: slack.uri(),
@@ -3738,6 +3876,7 @@ mod tests {
                     format: txwatch_config::WebhookFormat::Slack,
                     headers: Default::default(),
                     routing_key: None,
+                    ..Default::default()
                 },
             ],
             enabled: true,

@@ -199,6 +199,7 @@ fn test_pagerduty_resolve_snapshot() {
     payload.resolved = true;
 
     let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
         value["event_action"], "resolve",
@@ -219,6 +220,7 @@ fn test_pagerduty_severity_overrides_rule_type_heuristic() {
     payload.severity = Some("info".to_string());
 
     let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
         value["payload"]["severity"], "info",
@@ -234,6 +236,7 @@ fn test_pagerduty_critical_large_transfer() {
     payload.severity = Some("critical".to_string());
 
     let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(value["payload"]["severity"], "critical");
 }
@@ -245,6 +248,7 @@ fn test_pagerduty_severity_falls_back_to_rule_type() {
     payload.severity = None;
 
     let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
 
     assert_eq!(
         value["payload"]["severity"], "critical",
@@ -266,13 +270,14 @@ fn test_chat_formats_render_decimal_amount() {
         .map(|(name, value)| format!("{name}: {value}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let slack_body = txwatch_notifier::format::slack(&payload).to_string();
     assert!(
-        details.contains("0.9 XLM"),
-        "details must render trimmed decimal amount, got: {details}"
+        slack_body.contains("0.9 XLM"),
+        "details must render trimmed decimal amount, got: {slack_body}"
     );
     assert!(
-        !details.contains("0 XLM"),
-        "details must not render the truncated integer amount, got: {details}"
+        !slack_body.contains("0 XLM"),
+        "details must not render the truncated integer amount, got: {slack_body}"
     );
 
     payload.amount_xlm = Some(9999);
@@ -283,9 +288,10 @@ fn test_chat_formats_render_decimal_amount() {
         .map(|(name, value)| format!("{name}: {value}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let slack_body = txwatch_notifier::format::slack(&payload).to_string();
     assert!(
-        details.contains("9999.99 XLM"),
-        "details must render trimmed decimal amount, got: {details}"
+        slack_body.contains("9999.99 XLM"),
+        "details must render trimmed decimal amount, got: {slack_body}"
     );
 }
 

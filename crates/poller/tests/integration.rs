@@ -74,6 +74,8 @@ async fn run_polls_once_and_fires_webhook() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -146,6 +148,8 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -192,6 +196,8 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -470,6 +476,7 @@ async fn function_called_rule_fires_on_exact_match() {
         vec![AlertRule::FunctionCalled {
             function_name: "withdraw".into(),
             match_mode: Default::default(),
+            args: vec![],
         }],
     );
 
@@ -538,6 +545,106 @@ async fn function_called_rule_fires_on_exact_match() {
             .unwrap();
         }
     }
+}
+
+/// FunctionCalled with an argument matcher fires only on the invocation whose
+/// decoded argument matches, and the matched argument values are included in
+/// the webhook payload. Closes #266.
+#[tokio::test]
+async fn function_called_rule_matches_on_argument() {
+    use txwatch_config::ArgMatcher;
+    use txwatch_rules::FunctionInvocation;
+
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&receiver)
+        .await;
+
+    let client = txwatch_notifier::build_client().unwrap();
+    let contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::FunctionCalled {
+            function_name: "transfer".into(),
+            match_mode: Default::default(),
+            args: vec![ArgMatcher {
+                index: 1,
+                eq: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            }],
+        }],
+    );
+
+    let matching_to = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let other_to = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    let make_tx = |hash: &str, token: &str, to: &str| {
+        let tx = EnrichedTransaction::from_horizon(
+            txwatch_rules::HorizonTransaction {
+                hash: hash.into(),
+                created_at: "2024-06-01T10:00:00Z".into(),
+                successful: true,
+                paging_token: token.into(),
+                fee_charged: None,
+                source_account: None,
+                fee_account: None,
+                envelope_xdr: None,
+                result_xdr: None,
+                ledger: None,
+                ..Default::default()
+            },
+            vec!["transfer".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        tx.with_invocations(vec![FunctionInvocation::from_parameters(
+            "transfer".into(),
+            &[
+                serde_json::json!({ "i128": "1000" }),
+                serde_json::json!({ "address": to }),
+            ],
+        )])
+    };
+
+    let txs = vec![
+        make_tx("arg_miss", "1", other_to),
+        make_tx("arg_hit", "2", matching_to),
+    ];
+
+    let mut fired = 0;
+    for tx in &txs {
+        let payloads = evaluate(
+            &EvalContext {
+                label: &contract.label,
+                contract_id: &contract.contract_id,
+                network: contract.network.as_str(),
+                horizon_base: "https://horizon-testnet.stellar.org",
+                explorer_base: Some("https://stellar.expert/explorer/testnet"),
+            },
+            &contract.rules,
+            tx,
+            None,
+        );
+        for p in &payloads {
+            fired += 1;
+            assert_eq!(p.function_name.as_deref(), Some("transfer"));
+            assert!(
+                p.function_args.iter().any(|inv| inv.arg(1) == Some(matching_to)),
+                "payload must carry the matched argument values"
+            );
+            txwatch_notifier::send_webhook_simple(
+                &client,
+                contract.webhook_url.as_deref().unwrap(),
+                p,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    assert_eq!(fired, 1, "only the matching invocation should fire");
 }
 
 /// Cursor advances so the same transaction is not processed twice.
@@ -752,6 +859,7 @@ mod e2e_quickstart {
                 AlertRule::FunctionCalled {
                     function_name: "hello".into(),
                     match_mode: Default::default(),
+                    args: vec![],
                 },
                 AlertRule::TransactionFailed,
                 AlertRule::EventEmitted {
@@ -861,6 +969,8 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -927,6 +1037,8 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -1005,6 +1117,8 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -1104,7 +1218,9 @@ async fn contracts_polled_concurrently() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
         cursor_file: None,
+        ..Default::default()
     };
 
     // `run` never returns, so time how long it takes until both webhooks arrive.
@@ -1193,15 +1309,15 @@ async fn slow_contract_does_not_block_fast_contract() {
 
     let make_contract =
         |label: &str, contract_id: &str, horizon: &MockServer, receiver: &MockServer| {
-        let mut contract = helpers::contract(
-            &format!("{}/hook", receiver.uri()),
-            vec![AlertRule::AnyTransaction],
-        );
-        contract.label = label.to_string();
-        contract.contract_id = contract_id.to_string();
-        contract.horizon_base_url_override = Some(horizon.uri());
-        contract
-    };
+            let mut contract = helpers::contract(
+                &format!("{}/hook", receiver.uri()),
+                vec![AlertRule::AnyTransaction],
+            );
+            contract.label = label.to_string();
+            contract.contract_id = contract_id.to_string();
+            contract.horizon_base_url_override = Some(horizon.uri());
+            contract
+        };
 
     let cfg = AppConfig {
         poll_interval_seconds: 30,
@@ -1224,22 +1340,21 @@ async fn slow_contract_does_not_block_fast_contract() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
         cursor_file: None,
+        ..Default::default()
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(txwatch_poller::run_with_shutdown(cfg, false, shutdown_rx));
-    let fast_delivered = tokio::time::timeout(
-        Duration::from_millis(FAST_DEADLINE_MS),
-        async {
-            loop {
-                if !fast_receiver.received_requests().await.unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    let fast_delivered = tokio::time::timeout(Duration::from_millis(FAST_DEADLINE_MS), async {
+        loop {
+            if !fast_receiver.received_requests().await.unwrap().is_empty() {
+                break;
             }
-        },
-    )
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
     .is_ok();
 
@@ -1302,6 +1417,8 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1393,6 +1510,8 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
@@ -1450,6 +1569,8 @@ async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let report = txwatch_poller::run_once(cfg, true)
@@ -1524,6 +1645,8 @@ async fn cursor_file_is_persisted_after_a_poll_cycle() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1839,6 +1962,8 @@ async fn transactions_request_includes_failed() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
     };
 
     // Dry run: this asserts the request we send, not the delivery path.

@@ -10,12 +10,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, EVENT_TOPIC_WILDCARD};
-
-pub mod yield_calculator;
-pub use yield_calculator::{PoolYield, YieldCalculator};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -263,6 +260,86 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     }
 }
 
+// ── ScVal decoding (issue #266) ───────────────────────────────────────────────
+
+/// Decode a Soroban `ScVal` (in its JSON form) into a plain string for
+/// argument matching. Handles the common scalar types: `address`, `symbol`,
+/// `string`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, `bool`. Anything else
+/// falls back to its compact JSON rendering.
+pub fn decode_scval(value: &Value) -> String {
+    match value {
+        Value::Object(map) if map.len() == 1 => {
+            let (key, inner) = map.iter().next().expect("map has one entry");
+            match (key.as_str(), inner) {
+                ("address", Value::String(s))
+                | ("symbol", Value::String(s))
+                | ("string", Value::String(s)) => s.clone(),
+                ("u32", _)
+                | ("i32", _)
+                | ("u64", _)
+                | ("i64", _)
+                | ("u128", _)
+                | ("i128", _)
+                | ("bool", _) => match inner {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    other => other.to_string(),
+                },
+                _ => value.to_string(),
+            }
+        }
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A single decoded invocation argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedArg {
+    /// Zero-based position in the invocation's argument list.
+    pub index: usize,
+    /// Decoded textual value.
+    pub value: String,
+}
+
+/// A Soroban contract function invocation with its decoded arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionInvocation {
+    pub function_name: String,
+    /// Decoded arguments in order.
+    pub args: Vec<DecodedArg>,
+}
+
+impl FunctionInvocation {
+    /// Build from a function name and the raw `parameters` array (each element
+    /// is an `ScVal` in JSON form).
+    pub fn from_parameters(function_name: String, parameters: &[Value]) -> Self {
+        let args = parameters
+            .iter()
+            .enumerate()
+            .map(|(index, value)| DecodedArg {
+                index,
+                value: decode_scval(value),
+            })
+            .collect();
+        Self {
+            function_name,
+            args,
+        }
+    }
+
+    /// The decoded value at `index`, if present.
+    pub fn arg(&self, index: usize) -> Option<&str> {
+        self.args
+            .iter()
+            .find(|a| a.index == index)
+            .map(|a| a.value.as_str())
+    }
+}
+
 // ── Enriched transaction ──────────────────────────────────────────────────────
 
 /// A transaction enriched with Soroban-specific fields extracted from the
@@ -281,6 +358,9 @@ pub struct EnrichedTransaction {
     pub paging_token: String,
     /// All Soroban contract functions invoked in this transaction (may be multiple).
     pub function_names: Vec<String>,
+    /// Decoded invocations (function name + arguments) for this transaction.
+    /// Populated from the operation `parameters` array (issue #266).
+    pub invocations: Vec<FunctionInvocation>,
     /// Transfer amount in stroops (1 XLM = 10_000_000 stroops), if detected.
     /// Uses u64 because the total XLM supply is ~50 billion XLM = 5 × 10^17
     /// (500 quadrillion) stroops ([`MAX_XLM_SUPPLY_STROOPS`]), well within
@@ -374,6 +454,7 @@ impl EnrichedTransaction {
             successful: tx.successful,
             paging_token: tx.paging_token,
             function_names,
+            invocations: Vec::new(),
             // The sanitized values set above are authoritative; the raw ones
             // are deliberately not repeated here.
             source_account: tx.source_account,
@@ -440,6 +521,12 @@ impl EnrichedTransaction {
         self.events = events;
         self
     }
+
+    /// Attach decoded function invocations (with arguments).
+    pub fn with_invocations(mut self, invocations: Vec<FunctionInvocation>) -> Self {
+        self.invocations = invocations;
+        self
+    }
 }
 
 // ── AlertPayload ──────────────────────────────────────────────────────────────
@@ -474,6 +561,10 @@ pub struct AlertPayload {
     pub function_name: Option<String>,
     /// All invoked function names in this transaction.
     pub function_names: Vec<String>,
+    /// Decoded function invocations (name + arguments) for this transaction.
+    /// Empty when the operation parameters were not available (issue #266).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub function_args: Vec<FunctionInvocation>,
     /// Amount in whole XLM (truncated, stroops / 10_000_000), present for
     /// LargeTransfer. Kept for backward compatibility — use `amount_xlm_decimal`
     /// for precise accounting (e.g. 9,999.99 XLM appears here as `9999`).
@@ -532,6 +623,10 @@ pub struct AlertPayload {
     /// has no cooldown or nothing was suppressed.
     #[serde(default)]
     pub suppressed_count: u64,
+    /// Observed match count for a `Rate` rule breach (issue #267). `None` for
+    /// every other rule type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_count: Option<u64>,
     /// `true` only for synthetic payloads sent by `txwatch test-webhook`;
     /// omitted from the JSON otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -728,6 +823,7 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                     transaction_hash: tx.hash.clone(),
                     function_name: tx.function_names.first().cloned(),
                     function_names: tx.function_names.clone(),
+                    function_args: tx.invocations.clone(),
                     amount_xlm,
                     amount_stroops: tx.amount_stroops,
                     amount_xlm_decimal: amount_xlm_decimal.clone(),
@@ -748,6 +844,7 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                     resolved: false,
                     matched_events: matched_events(rule, tx),
                     suppressed_count: 0,
+                    observed_count: None,
                     test: false,
                     old_wasm_hash: upgrade_hashes(rule, tx).and_then(|(o, _)| o),
                     new_wasm_hash: upgrade_hashes(rule, tx).and_then(|(_, n)| n),
@@ -853,11 +950,29 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         AlertRule::FunctionCalled {
             function_name,
             match_mode,
-        } => tx.function_names.iter().any(|f| match match_mode {
-            FunctionMatchMode::Exact => f == function_name.as_str(),
-            FunctionMatchMode::Prefix => f.starts_with(function_name.as_str()),
-            FunctionMatchMode::Glob => glob_match(function_name, f),
-        }),
+            args,
+        } => {
+            // #266: A function matches when its name matches the mode AND every
+            // configured argument constraint holds. When `args` is empty this
+            // reduces to the original name-only behaviour.
+            let name_matches = |f: &str| match match_mode {
+                FunctionMatchMode::Exact => f == function_name.as_str(),
+                FunctionMatchMode::Prefix => f.starts_with(function_name.as_str()),
+                FunctionMatchMode::Glob => glob_match(function_name, f),
+            };
+            if args.is_empty() {
+                tx.function_names.iter().any(|f| name_matches(f))
+            } else {
+                // Argument constraints require decoded invocations.
+                tx.invocations.iter().any(|inv| {
+                    name_matches(&inv.function_name)
+                        && args.iter().all(|constraint| {
+                            inv.arg(constraint.index as usize)
+                                .is_some_and(|v| v == constraint.eq.as_str())
+                        })
+                })
+            }
+        }
 
         AlertRule::AdminFunctionCalled { function_names } => tx.function_names.iter().any(|f| {
             let f_lower = f.to_lowercase();
@@ -912,6 +1027,25 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             }
         }
 
+        // #268: Memo rule. `memo_type` (when set) must match the transaction's
+        // memo type; `equals` / `prefix` constrain the memo text.
+        AlertRule::Memo {
+            memo_type,
+            equals,
+            prefix,
+        } => {
+            if let Some(required_type) = memo_type {
+                if tx.memo_type.as_deref() != Some(required_type.as_str()) {
+                    return Ok(false);
+                }
+            }
+            let Some(memo) = tx.memo.as_deref() else {
+                return Ok(false);
+            };
+            equals.as_deref().is_none_or(|eq| memo == eq)
+                && prefix.as_deref().is_none_or(|p| memo.starts_with(p))
+        }
+
         AlertRule::All { rules } => {
             for entry in rules {
                 if !entry.enabled {
@@ -954,6 +1088,10 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .wasm_upgrade
             .as_ref()
             .is_some_and(|u| u.contract_id == tx.watched_contract_id),
+
+        // #267: Rate is a stateful, windowed rule evaluated by `RateTracker`,
+        // not a per-transaction rule. It never fires here.
+        AlertRule::Rate { .. } => false,
     })
 }
 
@@ -999,9 +1137,12 @@ fn rule_label(rule: &AlertRule) -> String {
         AlertRule::LargeTransfer { threshold_xlm, .. } => {
             format!("LargeTransfer(>={}XLM)", threshold_xlm)
         }
+        // #266: argument matchers are part of the label (see AlertRule::label).
+        AlertRule::FunctionCalled { args, .. } if !args.is_empty() => rule.label(),
         AlertRule::FunctionCalled {
             function_name,
             match_mode,
+            ..
         } => match match_mode {
             FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
             FunctionMatchMode::Prefix => format!("FunctionCalled(prefix:{})", function_name),
@@ -1065,6 +1206,7 @@ fn rule_label(rule: &AlertRule) -> String {
             txwatch_config::event_emitted_label(topic, topics)
         }
         AlertRule::ContractUpgraded => "ContractUpgraded".into(),
+        AlertRule::Rate { .. } | AlertRule::Memo { .. } => rule.label(),
     }
 }
 
@@ -1166,6 +1308,7 @@ pub fn check_no_activity(
                 operation_count: None,
                 matched_events: vec![],
                 suppressed_count: 0,
+                observed_count: None,
                 test: false,
                 old_wasm_hash: None,
                 new_wasm_hash: None,
@@ -1174,6 +1317,7 @@ pub fn check_no_activity(
                 transaction_hash: synthetic_hash,
                 function_name: None,
                 function_names: vec![],
+                function_args: vec![],
                 amount_xlm: None,
                 fee_charged_stroops: None,
                 timestamp: ts,
@@ -1224,6 +1368,7 @@ pub fn check_no_activity(
                 operation_count: None,
                 matched_events: vec![],
                 suppressed_count: 0,
+                observed_count: None,
                 test: false,
                 old_wasm_hash: None,
                 new_wasm_hash: None,
@@ -1232,6 +1377,7 @@ pub fn check_no_activity(
                 transaction_hash: synthetic_hash,
                 function_name: None,
                 function_names: vec![],
+                function_args: vec![],
                 amount_xlm: None,
                 fee_charged_stroops: None,
                 timestamp: ts,
@@ -1458,6 +1604,104 @@ impl CooldownTracker {
     }
 }
 
+// ── Rate rules (issue #267) ───────────────────────────────────────────────────
+
+/// Evaluates `Rate` rules, which fire when their nested rule matches at least
+/// `count` times within a sliding `window_seconds` window.
+///
+/// Matches are tracked per (contract, rule). A breach emits one alert carrying
+/// `observed_count` and clears the window, so the next alert needs another
+/// `count` matches. The current time is passed in by the caller, so tests
+/// control the clock.
+#[derive(Debug, Default)]
+pub struct RateTracker {
+    hits: HashMap<(String, String), VecDeque<DateTime<Utc>>>,
+}
+
+impl RateTracker {
+    /// An empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `tx` against every `Rate` rule in `rules` at time `now` and
+    /// return one payload per rule whose threshold was breached. Non-`Rate`
+    /// rules are ignored; they are handled by [`evaluate`].
+    pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
+        &mut self,
+        ctx: &EvalContext<'_>,
+        rules: &[R],
+        tx: &EnrichedTransaction,
+        now: DateTime<Utc>,
+    ) -> Vec<AlertPayload> {
+        let mut out = Vec::new();
+        for entry in rules.iter().filter(|e| e.enabled()) {
+            let rule: &AlertRule = entry.as_ref();
+            let AlertRule::Rate {
+                rule: inner,
+                count,
+                window_seconds,
+            } = rule
+            else {
+                continue;
+            };
+            if !inner.enabled {
+                continue;
+            }
+            match eval_rule(&inner.rule, tx) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        tx = %tx.hash,
+                        rule = %rule.label(),
+                        error = %e,
+                        "rate rule evaluation error — skipping"
+                    );
+                    continue;
+                }
+            }
+
+            let label = rule.label();
+            let window = i64::try_from(*window_seconds)
+                .ok()
+                .and_then(chrono::TimeDelta::try_seconds)
+                .unwrap_or(chrono::TimeDelta::MAX);
+            let hits = self
+                .hits
+                .entry((ctx.contract_id.to_owned(), label.clone()))
+                .or_default();
+            hits.push_back(now);
+            while hits
+                .front()
+                .is_some_and(|t| now.signed_duration_since(*t) >= window)
+            {
+                hits.pop_front();
+            }
+            let observed = hits.len() as u64;
+            if observed < *count {
+                continue;
+            }
+            hits.clear();
+
+            // Build the payload from the nested rule so every transaction
+            // field is filled the same way, then relabel it as the rate rule.
+            let mut payloads = evaluate(ctx, std::slice::from_ref(&inner.rule), tx, None);
+            if let Some(mut payload) = payloads.pop() {
+                payload.rule_type = rule.rule_type().to_string();
+                payload.alert_id = alert_id(ctx.contract_id, &tx.hash, &label);
+                payload.rule_triggered = label;
+                payload.observed_count = Some(observed);
+                payload.severity = entry.severity().map(|s| s.to_string());
+                payload.effective_webhook_url = entry.webhook_url().map(str::to_owned);
+                payload.effective_webhook_secret = entry.webhook_secret().map(str::to_owned);
+                out.push(payload);
+            }
+        }
+        out
+    }
+}
+
 // ── Glob matching (issue #55) ─────────────────────────────────────────────────
 
 /// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
@@ -1532,6 +1776,7 @@ mod tests {
             successful,
             paging_token: "100".into(),
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
+            invocations: Vec::new(),
             amount_stroops,
             fee_charged_stroops: None,
             source_account: None,
@@ -1607,10 +1852,12 @@ mod tests {
             rule_label(&AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: Default::default(),
+                args: vec![],
             }),
             AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             }
             .label(),
             "FunctionCalled(withdraw)"
@@ -1653,6 +1900,7 @@ mod tests {
             AlertRule::FunctionCalled {
                 function_name: "f".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             }
             .rule_type(),
             "FunctionCalled"
@@ -1688,6 +1936,7 @@ mod tests {
             AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             },
             AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into(), "upgrade".into()],
@@ -1704,6 +1953,7 @@ mod tests {
             successful: false,
             paging_token: "1".into(),
             function_names: vec!["withdraw".into(), "set_admin".into()],
+            invocations: Vec::new(),
             amount_stroops: Some(100_000_000_000_000),
             fee_charged_stroops: Some(50_000),
             source_account: None,
@@ -1860,6 +2110,7 @@ mod tests {
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             })],
             &tx,
         );
@@ -1874,6 +2125,7 @@ mod tests {
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             })],
             &tx,
         );
@@ -1900,6 +2152,7 @@ mod tests {
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             })],
             &tx,
         );
@@ -1957,6 +2210,7 @@ mod tests {
                 successful: true,
                 paging_token: "1".into(),
                 function_names: vec![],
+                invocations: Vec::new(),
                 amount_stroops: None,
                 fee_charged_stroops: None,
                 source_account: None,
@@ -2105,6 +2359,7 @@ mod tests {
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             })],
             &tx,
         );
@@ -2119,6 +2374,7 @@ mod tests {
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
                 match_mode: FunctionMatchMode::default(),
+                args: vec![],
             })],
             &tx,
         );
@@ -2205,6 +2461,7 @@ mod tests {
             transaction_hash: "abc123".into(),
             function_name: Some("transfer".into()),
             function_names: vec!["transfer".into()],
+            function_args: vec![],
             amount_xlm: Some(15000),
             amount_stroops: Some(150_000_000_000_000),
             amount_xlm_decimal: Some("15000.0000000".into()),
@@ -2224,6 +2481,7 @@ mod tests {
             resolved: false,
             matched_events: vec![],
             suppressed_count: 0,
+            observed_count: None,
             test: false,
             old_wasm_hash: None,
             new_wasm_hash: None,
@@ -2363,6 +2621,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
                 RuleEntry {
@@ -2400,6 +2659,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
                 RuleEntry {
@@ -2435,6 +2695,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
                 RuleEntry {
@@ -2445,6 +2706,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "upgrade".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
             ],
@@ -2492,6 +2754,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
                 RuleEntry {
@@ -3193,6 +3456,7 @@ mod suppressor_tests {
             successful: false,
             paging_token: "1".into(),
             function_names: vec![],
+            invocations: Vec::new(),
             amount_stroops: None,
             fee_charged_stroops: None,
             source_account: None,
@@ -3294,6 +3558,7 @@ mod suppressor_tests {
             successful,
             paging_token: "100".into(),
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
+            invocations: Vec::new(),
             amount_stroops: amount,
             fee_charged_stroops: None,
             source_account: None,
@@ -3595,6 +3860,106 @@ mod suppressor_tests {
             rule_label(&event_rule("transfer", &["*", "GTO"])),
             "EventEmitted(transfer, *, GTO)"
         );
+    }
+
+    // ── Issue #244: EventEmitted nested inside composite rules ─────────────────
+
+    #[test]
+    fn event_emitted_nested_in_composite_all_fires_when_both_match() {
+        let all_rule = AlertRule::All {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::FunctionCalled {
+                        function_name: "deposit".into(),
+                        match_mode: FunctionMatchMode::Exact,
+                        args: vec![],
+                    },
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: event_rule("transfer", &[]),
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        };
+
+        // Tx with both function and event: fires
+        let matching_tx = make_tx(true, &["deposit"], None).with_events(vec![transfer_event()]);
+        let payloads = run(std::slice::from_ref(&all_rule), &matching_tx);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "composite All with nested EventEmitted must fire when both match"
+        );
+        assert_eq!(payloads[0].matched_events.len(), 1);
+
+        // Tx with function only (no event): does not fire
+        let no_event_tx = make_tx(true, &["deposit"], None);
+        let payloads = run(std::slice::from_ref(&all_rule), &no_event_tx);
+        assert!(
+            payloads.is_empty(),
+            "composite All must not fire when nested EventEmitted has no events"
+        );
+
+        // Tx with event only (no matching function): does not fire
+        let no_fn_tx = make_tx(true, &["withdraw"], None).with_events(vec![transfer_event()]);
+        let payloads = run(&[all_rule], &no_fn_tx);
+        assert!(
+            payloads.is_empty(),
+            "composite All must not fire when function does not match"
+        );
+    }
+
+    #[test]
+    fn event_emitted_nested_in_composite_any_and_not() {
+        let any_rule = AlertRule::Any {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::TransactionFailed,
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: event_rule("transfer", &[]),
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        };
+
+        // Successful tx with transfer event fires Any
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        let payloads = run(&[any_rule], &tx);
+        assert_eq!(payloads.len(), 1);
+
+        let not_rule = AlertRule::Not {
+            rule: Box::new(RuleEntry {
+                rule: event_rule("transfer", &[]),
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }),
+        };
+
+        // Tx without transfer event fires Not
+        let no_event_tx = make_tx(true, &[], None);
+        let payloads = run(std::slice::from_ref(&not_rule), &no_event_tx);
+        assert_eq!(payloads.len(), 1);
+
+        // Tx with transfer event does not fire Not
+        let payloads = run(&[not_rule], &tx);
+        assert!(payloads.is_empty());
     }
 
     #[test]

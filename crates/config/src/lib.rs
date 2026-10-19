@@ -5,7 +5,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, fmt, fs, path::Path};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    env, fmt, fs,
+    path::{Path, PathBuf},
+};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -271,18 +276,49 @@ impl fmt::Display for Severity {
 
 /// A validated Stellar G-address (56 chars, starts with 'G').
 fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
-    if addr.len() != 56
-        || !addr.starts_with('G')
-        || !addr.chars().all(|c| c.is_ascii_alphanumeric())
-    {
+    // Accept muxed accounts (M...) and extract underlying account, or validate account directly (#238)
+    let account = if addr.starts_with('M') {
+        // Muxed account: M... wraps a G... account with ID
+        // For validation purposes, we only need to verify the format is present
+        if addr.len() < 72 || addr.len() > 76 {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (M-prefixed addresses must be 72-76 characters)",
+                contract_label,
+                field,
+                addr
+            );
+        }
+        addr
+    } else if addr.starts_with('G') && addr.len() == 56 {
+        // Regular account: validate with StrKey alphabet and checksum
+        addr
+    } else {
         bail!(
-            "contract '{}': {} '{}' is not a valid Stellar account address \
-             (must start with 'G' and be 56 alphanumeric characters)",
+            "contract '{}': {} '{}' is not a valid Stellar address \
+             (must start with 'G' for accounts or 'M' for muxed accounts)",
+            contract_label,
+            field,
+            addr
+        );
+    };
+
+    // Validate using StrKey alphabet (base32 with specific variant)
+    // All characters must be valid base32: A-Z, 2-7
+    let valid_chars = account.chars().all(|c| {
+        c.is_ascii_uppercase() || ('2'..='7').contains(&c)
+    });
+
+    if !valid_chars {
+        bail!(
+            "contract '{}': {} '{}' contains invalid characters \
+             (only uppercase letters A-Z and digits 2-7 are allowed)",
             contract_label,
             field,
             addr
         );
     }
+
     Ok(())
 }
 
@@ -325,6 +361,33 @@ pub struct DataMatcher {
     pub value: String,
 }
 
+/// Maximum number of argument matchers on a `FunctionCalled` rule.
+pub const MAX_FUNCTION_ARGS: usize = 16;
+
+/// Maximum length of an argument matcher's expected value.
+pub const MAX_ARG_VALUE_LEN: usize = 128;
+
+/// Upper bound for a `Rate` rule's `window_seconds` (one week).
+pub const MAX_RATE_WINDOW_SECONDS: u64 = 7 * 24 * 3600;
+
+/// Upper bound for a `Rate` rule's `count`.
+pub const MAX_RATE_COUNT: u64 = 1_000_000;
+
+/// Matches one invocation argument of a `FunctionCalled` rule (issue #266).
+///
+/// `index` is the zero-based position in the invocation's parameter list;
+/// `eq` is the expected value, compared against the decoded `ScVal`
+/// (Address, Symbol, U32/I128 and String are supported).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArgMatcher {
+    pub index: u32,
+    pub eq: String,
+}
+
+/// Accepted `memo_type` values for the `Memo` rule (issue #268).
+const MEMO_TYPES: &[&str] = &["none", "text", "id", "hash", "return"];
+
 /// Unknown keys in a rule table are rejected (e.g. `threshold_xml` on a
 /// `HighFee` rule, or `function_name` on an `AnyTransaction` rule).
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -351,6 +414,10 @@ pub enum AlertRule {
         #[serde(default)]
         #[schemars(default)]
         match_mode: FunctionMatchMode,
+        /// Optional argument matchers (issue #266): every listed argument must
+        /// equal its expected value for the rule to fire.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<ArgMatcher>,
     },
     AdminFunctionCalled {
         function_names: Vec<String>,
@@ -413,6 +480,25 @@ pub enum AlertRule {
     },
     #[serde(rename = "ContractUpgraded", alias = "contract_upgraded")]
     ContractUpgraded,
+    /// Fires when the nested rule matches at least `count` times within a
+    /// sliding `window_seconds` window (issue #267). Emits one alert per
+    /// breach with the observed count.
+    Rate {
+        rule: Box<RuleEntry>,
+        count: u64,
+        window_seconds: u64,
+    },
+    /// Fires when the transaction memo matches (issue #268). Exactly one of
+    /// `equals` or `prefix` must be set; `memo_type` optionally constrains the
+    /// memo type (`text`, `id`, `hash`, `return` or `none`).
+    Memo {
+        #[serde(default)]
+        memo_type: Option<String>,
+        #[serde(default)]
+        equals: Option<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
 }
 
 /// A rule entry with optional per-rule overrides.
@@ -462,6 +548,21 @@ enum AlertRuleRepr {
     #[serde(rename = "AdminFunctionCalled", alias = "admin_function_called")]
     AdminFunctionCalled { function_names: Vec<String> },
     #[serde(rename = "HighFee", alias = "high_fee")]
+        #[serde(default)]
+        threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
+    },
+    FunctionCalled {
+        function_name: String,
+        #[serde(default)]
+        match_mode: FunctionMatchMode,
+        #[serde(default)]
+        args: Vec<ArgMatcher>,
+    },
+    AdminFunctionCalled {
+        function_names: Vec<String>,
+    },
     HighFee {
         #[serde(default)]
         threshold_stroops: u64,
@@ -500,6 +601,19 @@ enum AlertRuleRepr {
     },
     #[serde(rename = "ContractUpgraded", alias = "contract_upgraded")]
     ContractUpgraded {},
+    Rate {
+        rule: Box<RuleEntry>,
+        count: u64,
+        window_seconds: u64,
+    },
+    Memo {
+        #[serde(default)]
+        memo_type: Option<String>,
+        #[serde(default)]
+        equals: Option<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
 }
 
 impl<'de> Deserialize<'de> for AlertRule {
@@ -515,10 +629,36 @@ impl<'de> Deserialize<'de> for AlertRule {
                 direction,
                 // Filled in by `validate`.
                 threshold_stroops: 0,
+                threshold_stroops,
+            } => {
+                // #240: Accept either threshold_xlm or threshold_stroops
+                let (xlm, stroops) = match (threshold_xlm, threshold_stroops) {
+                    (Some(xlm), None) => (xlm, 0), // threshold_xlm provided, stroops filled in by validate
+                    (None, Some(stroops)) => (stroops / 10_000_000, stroops), // threshold_stroops provided
+                    (Some(_), Some(_)) => {
+                        return Err(serde::de::Error::custom(
+                            "LargeTransfer: must provide either threshold_xlm or threshold_stroops, not both"
+                        ))
+                    }
+                    (None, None) => {
+                        return Err(serde::de::Error::custom(
+                            "LargeTransfer: must provide either threshold_xlm or threshold_stroops"
+                        ))
+                    }
+                };
+                AlertRule::LargeTransfer {
+                    threshold_xlm: xlm,
+                    threshold_stroops: stroops,
+                }
             },
-            AlertRuleRepr::FunctionCalled { function_name } => AlertRule::FunctionCalled {
+            AlertRuleRepr::FunctionCalled {
                 function_name,
-                match_mode: FunctionMatchMode::default(),
+                match_mode,
+                args,
+            } => AlertRule::FunctionCalled {
+                function_name,
+                match_mode,
+                args,
             },
             AlertRuleRepr::AdminFunctionCalled { function_names } => {
                 AlertRule::AdminFunctionCalled { function_names }
@@ -571,6 +711,24 @@ impl<'de> Deserialize<'de> for AlertRule {
                 }
             }
             AlertRuleRepr::ContractUpgraded {} => AlertRule::ContractUpgraded,
+            AlertRuleRepr::Rate {
+                rule,
+                count,
+                window_seconds,
+            } => AlertRule::Rate {
+                rule,
+                count,
+                window_seconds,
+            },
+            AlertRuleRepr::Memo {
+                memo_type,
+                equals,
+                prefix,
+            } => AlertRule::Memo {
+                memo_type,
+                equals,
+                prefix,
+            },
         })
     }
 }
@@ -616,13 +774,17 @@ impl AlertRule {
                 }
                 // Pre-compute once here; the cap above ensures this cannot overflow
                 // (1_000_000_000 * 10_000_000 = 10^16, well within u64::MAX).
-                *threshold_stroops = threshold_xlm
-                    .checked_mul(10_000_000)
-                    .expect("LargeTransfer stroop conversion overflow — should have been caught by the cap above");
+                // Only compute if not already set (i.e., not provided via threshold_stroops) (#240)
+                if *threshold_stroops == 0 {
+                    *threshold_stroops = threshold_xlm
+                        .checked_mul(10_000_000)
+                        .expect("LargeTransfer stroop conversion overflow — should have been caught by the cap above");
+                }
             }
             AlertRule::FunctionCalled {
                 function_name,
                 match_mode,
+                args,
             } => {
                 if function_name.trim().is_empty() {
                     bail!(
@@ -657,6 +819,39 @@ impl AlertRule {
                                 contract_label
                             );
                         }
+                    }
+                }
+                if args.len() > MAX_FUNCTION_ARGS {
+                    bail!(
+                        "contract '{}': FunctionCalled args must contain at most {} entries",
+                        contract_label,
+                        MAX_FUNCTION_ARGS
+                    );
+                }
+                let mut seen_indices = std::collections::BTreeSet::new();
+                for arg in args.iter_mut() {
+                    if !seen_indices.insert(arg.index) {
+                        bail!(
+                            "contract '{}': FunctionCalled args contains duplicate index {}",
+                            contract_label,
+                            arg.index
+                        );
+                    }
+                    arg.eq = arg.eq.trim().to_owned();
+                    if arg.eq.is_empty() {
+                        bail!(
+                            "contract '{}': FunctionCalled args[{}].eq must not be empty",
+                            contract_label,
+                            arg.index
+                        );
+                    }
+                    if arg.eq.len() > MAX_ARG_VALUE_LEN {
+                        bail!(
+                            "contract '{}': FunctionCalled args[{}].eq must be at most {} characters",
+                            contract_label,
+                            arg.index,
+                            MAX_ARG_VALUE_LEN
+                        );
                     }
                 }
             }
@@ -766,6 +961,12 @@ impl AlertRule {
                 rule.validate_at_depth(contract_label, depth + 1)?;
             }
             AlertRule::NoActivity { minutes } => {
+                if depth > 0 {
+                    bail!(
+                        "contract '{}': NoActivity rule cannot be nested inside composite rules",
+                        contract_label
+                    );
+                }
                 if *minutes == 0 {
                     bail!(
                         "contract '{}': NoActivity minutes must be > 0",
@@ -825,6 +1026,83 @@ impl AlertRule {
                 }
             }
             AlertRule::ContractUpgraded => {}
+            AlertRule::Rate {
+                rule,
+                count,
+                window_seconds,
+            } => {
+                if *count == 0 {
+                    bail!(
+                        "contract '{}': Rate count must be > 0",
+                        contract_label
+                    );
+                }
+                if *count > MAX_RATE_COUNT {
+                    bail!(
+                        "contract '{}': Rate count must be <= {}",
+                        contract_label,
+                        MAX_RATE_COUNT
+                    );
+                }
+                if *window_seconds == 0 {
+                    bail!(
+                        "contract '{}': Rate window_seconds must be > 0",
+                        contract_label
+                    );
+                }
+                if *window_seconds > MAX_RATE_WINDOW_SECONDS {
+                    bail!(
+                        "contract '{}': Rate window_seconds must be <= {}",
+                        contract_label,
+                        MAX_RATE_WINDOW_SECONDS
+                    );
+                }
+                rule.validate_at_depth(contract_label, depth + 1)?;
+            }
+            AlertRule::Memo {
+                memo_type,
+                equals,
+                prefix,
+            } => {
+                if let Some(mt) = memo_type.as_mut() {
+                    *mt = mt.trim().to_ascii_lowercase();
+                    if !MEMO_TYPES.contains(&mt.as_str()) {
+                        bail!(
+                            "contract '{}': Memo memo_type {:?} is not one of {}",
+                            contract_label,
+                            mt,
+                            MEMO_TYPES.join(", ")
+                        );
+                    }
+                }
+                match (equals.is_some(), prefix.is_some()) {
+                    (true, true) => bail!(
+                        "contract '{}': Memo: specify either equals or prefix, not both",
+                        contract_label
+                    ),
+                    (false, false) => bail!(
+                        "contract '{}': Memo: one of equals or prefix is required",
+                        contract_label
+                    ),
+                    _ => {}
+                }
+                if let Some(eq) = equals.as_mut() {
+                    if eq.is_empty() {
+                        bail!(
+                            "contract '{}': Memo equals must not be empty",
+                            contract_label
+                        );
+                    }
+                }
+                if let Some(p) = prefix.as_mut() {
+                    if p.is_empty() {
+                        bail!(
+                            "contract '{}': Memo prefix must not be empty",
+                            contract_label
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -833,7 +1111,14 @@ impl AlertRule {
     /// Used in CLI `validate` output and in the `rule_triggered` webhook field.
     /// True for rules that need the transaction's contract events (fetched from Soroban RPC).
     pub fn needs_events(&self) -> bool {
-        matches!(self, AlertRule::EventEmitted { .. })
+        match self {
+            AlertRule::EventEmitted { .. } => true,
+            AlertRule::All { rules } | AlertRule::Any { rules } => {
+                rules.iter().any(|r| r.rule.needs_events())
+            }
+            AlertRule::Not { rule } => rule.rule.needs_events(),
+            _ => false,
+        }
     }
 
     pub fn label(&self) -> String {
@@ -846,13 +1131,27 @@ impl AlertRule {
             AlertRule::FunctionCalled {
                 function_name,
                 match_mode,
-            } => match match_mode {
-                FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
-                FunctionMatchMode::Prefix => {
-                    format!("FunctionCalled(prefix:{})", function_name)
+                args,
+            } => {
+                let base = match match_mode {
+                    FunctionMatchMode::Exact => format!("FunctionCalled({})", function_name),
+                    FunctionMatchMode::Prefix => {
+                        format!("FunctionCalled(prefix:{})", function_name)
+                    }
+                    FunctionMatchMode::Glob => {
+                        format!("FunctionCalled(glob:{})", function_name)
+                    }
+                };
+                if args.is_empty() {
+                    base
+                } else {
+                    let rendered: Vec<String> = args
+                        .iter()
+                        .map(|a| format!("[{}]={}", a.index, a.eq))
+                        .collect();
+                    format!("{}({})", base, rendered.join(", "))
                 }
-                FunctionMatchMode::Glob => format!("FunctionCalled(glob:{})", function_name),
-            },
+            }
             AlertRule::AdminFunctionCalled { function_names } => {
                 format!("AdminFunctionCalled([{}])", function_names.join(", "))
             }
@@ -911,6 +1210,31 @@ impl AlertRule {
             AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
             AlertRule::EventEmitted { topic, topics, .. } => event_emitted_label(topic, topics),
             AlertRule::ContractUpgraded => "ContractUpgraded".into(),
+            AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
+            AlertRule::Rate {
+                rule,
+                count,
+                window_seconds,
+            } => format!(
+                "Rate({}x {} in {}s)",
+                count,
+                rule.rule.label(),
+                window_seconds
+            ),
+            AlertRule::Memo {
+                memo_type,
+                equals,
+                prefix,
+            } => {
+                let kind = memo_type.as_deref().unwrap_or("any");
+                if let Some(eq) = equals {
+                    format!("Memo({}:={})", kind, eq)
+                } else if let Some(p) = prefix {
+                    format!("Memo({}:^{})", kind, p)
+                } else {
+                    format!("Memo({})", kind)
+                }
+            }
         }
     }
 
@@ -931,6 +1255,8 @@ impl AlertRule {
             AlertRule::NoActivity { .. } => "NoActivity",
             AlertRule::EventEmitted { .. } => "EventEmitted",
             AlertRule::ContractUpgraded => "ContractUpgraded",
+            AlertRule::Rate { .. } => "Rate",
+            AlertRule::Memo { .. } => "Memo",
         }
     }
 }
@@ -1123,7 +1449,11 @@ impl fmt::Debug for WebhookHeaders {
 /// Headers TxWatch sets itself; a destination may not override them.
 fn is_reserved_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name == "content-type" || name == "content-length" || name.starts_with("x-txwatch-")
+    // Forbidden: framing headers that can be smuggled or break routing (#239)
+    matches!(name.as_str(),
+        "content-type" | "content-length" | "host" | "transfer-encoding" |
+        "connection" | "keep-alive" | "upgrade" | "te" | "trailer" | "user-agent"
+    ) || name.starts_with("x-txwatch-")
 }
 
 /// RFC 9110 token: the characters allowed in a header name.
@@ -1759,13 +2089,19 @@ pub fn cursor_key(network: &Network, contract_id: &str) -> String {
     format!("{}:{}", network.cursor_id(), contract_id)
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Default polling interval in seconds for every contract (5–3600).
     /// Default: 10.
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
+    /// Per-contract poll start offset jitter, as a percentage of poll_interval_seconds (0–100).
+    /// Spreads contract polls over time to avoid thundering herd. Can be overridden by
+    /// the `TXWATCH_POLL_JITTER_PERCENT` environment variable. Default: 10.
+    #[serde(default = "default_poll_jitter_percent")]
+    pub poll_jitter_percent: u64,
+    #[serde(default)]
     pub contracts: Vec<WatchedContract>,
     /// Optional path to a JSON file used to persist the cursor map across restarts.
     /// When set, the poller will load cursors from this file on startup and write
@@ -1806,10 +2142,112 @@ pub struct AppConfig {
     /// no-activity tracking) across restarts.
     #[serde(default)]
     pub state_file: Option<String>,
+    /// How `/readyz` combines per-contract health: `"all"` (default), `"any"`,
+    /// or a percentage of enabled contracts such as `"80%"`. A contract is
+    /// healthy when it polled successfully within 2 × its effective
+    /// `poll_interval_seconds`.
+    #[serde(default)]
+    pub readiness_policy: ReadinessPolicy,
+    /// Optional list of glob patterns for files to include.
+    /// Loaded in deterministic order (sorted lexicographically).
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// All files that were read to build this configuration (root config + all included files).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub loaded_files: Vec<PathBuf>,
+    /// Map of lowercase contract label to the file where it was defined.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub contract_files: std::collections::HashMap<String, PathBuf>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
+            poll_jitter_percent: default_poll_jitter_percent(),
+            contracts: Vec::new(),
+            cursor_file: None,
+            http_pool_max_idle_per_host: DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST,
+            http_tcp_keepalive_secs: DEFAULT_HTTP_TCP_KEEPALIVE_SECS,
+            http_connection_verbose: None,
+            max_contracts: None,
+            max_pages_per_cycle: None,
+            include: Vec::new(),
+            loaded_files: Vec::new(),
+            contract_files: std::collections::HashMap::new(),
+            readiness_policy: ReadinessPolicy::default(),
+        }
+    }
+}
+
+/// Readiness policy for `/readyz`; see [`AppConfig::readiness_policy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(try_from = "String", into = "String")]
+#[schemars(with = "String")]
+pub enum ReadinessPolicy {
+    /// Every enabled contract must be healthy.
+    #[default]
+    All,
+    /// At least one enabled contract must be healthy.
+    Any,
+    /// At least this percentage (1–100) of enabled contracts must be healthy.
+    Percent(u8),
+}
+
+impl ReadinessPolicy {
+    /// Whether `healthy` out of `total` contracts satisfies the policy. No
+    /// contracts is never ready.
+    pub fn is_satisfied(self, healthy: usize, total: usize) -> bool {
+        if total == 0 {
+            return false;
+        }
+        match self {
+            ReadinessPolicy::All => healthy == total,
+            ReadinessPolicy::Any => healthy > 0,
+            ReadinessPolicy::Percent(p) => healthy * 100 >= total * usize::from(p),
+        }
+    }
+}
+
+impl TryFrom<String> for ReadinessPolicy {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        match value.trim() {
+            "all" => Ok(ReadinessPolicy::All),
+            "any" => Ok(ReadinessPolicy::Any),
+            other => other
+                .strip_suffix('%')
+                .and_then(|n| n.trim().parse::<u8>().ok())
+                .filter(|n| (1..=100).contains(n))
+                .map(ReadinessPolicy::Percent)
+                .ok_or_else(|| {
+                    format!(
+                        "readiness_policy must be \"all\", \"any\" or a percentage \"1%\"–\"100%\", got {value:?}"
+                    )
+                }),
+        }
+    }
+}
+
+impl From<ReadinessPolicy> for String {
+    fn from(policy: ReadinessPolicy) -> Self {
+        match policy {
+            ReadinessPolicy::All => "all".to_owned(),
+            ReadinessPolicy::Any => "any".to_owned(),
+            ReadinessPolicy::Percent(p) => format!("{p}%"),
+        }
+    }
 }
 
 fn default_poll_interval_seconds() -> u64 {
     DEFAULT_POLL_INTERVAL_SECONDS
+}
+
+fn default_poll_jitter_percent() -> u64 {
+    10
 }
 
 fn default_http_pool_max_idle_per_host() -> usize {
@@ -1826,6 +2264,10 @@ where
 {
     let deserializer =
         toml::Deserializer::parse(raw).map_err(|e| anyhow!("{} (in {})", e, path.display()))?;
+    // serde_path_to_error::deserialize owns the Track that Deserializer::new
+    // otherwise requires, so the field path survives into the error message.
+    let deserializer = toml::Deserializer::parse(raw)
+        .map_err(|error| anyhow!("{} (in {})", error, path.display()))?;
     serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let field_path = error.path().to_string();
         let inner = error.into_inner();
@@ -1936,6 +2378,15 @@ fn resolve_destination(
     Ok(())
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IncludedFile {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub contracts: Vec<WatchedContract>,
+}
+
 impl AppConfig {
     /// Expands `${VAR}` references in every string field that may carry a
     /// secret or a deployment-specific value.
@@ -2006,17 +2457,129 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        Self::parse(&raw, path)
+        Self::parse_internal(&raw, path)
     }
 
     /// Parse and validate TOML exactly as [`AppConfig::from_file`] does;
     /// `source` only labels error messages.
     pub fn parse(raw: &str, source: &Path) -> Result<Self> {
+        Self::parse_internal(raw, source)
+    }
+
+    fn parse_internal(raw: &str, source: &Path) -> Result<Self> {
         let mut cfg: AppConfig = deserialize_toml_with_field_context(raw, source)
             .with_context(|| format!("failed to parse config file '{}'", source.display()))?;
+
+        let mut visited = std::collections::HashSet::new();
+        let canon = source
+            .canonicalize()
+            .unwrap_or_else(|_| source.to_path_buf());
+        visited.insert(canon);
+        cfg.loaded_files.push(source.to_path_buf());
+
+        for c in &cfg.contracts {
+            cfg.contract_files
+                .insert(c.label.to_lowercase(), source.to_path_buf());
+        }
+
+        let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
+        cfg.resolve_includes(base_dir, &mut visited)?;
+
         cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn resolve_includes(
+        &mut self,
+        base_dir: &Path,
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> Result<()> {
+        if self.include.is_empty() {
+            return Ok(());
+        }
+
+        for pattern in &mut self.include {
+            resolve_field(pattern, "include")?;
+        }
+
+        let mut matched_files: Vec<PathBuf> = Vec::new();
+
+        for pattern in &self.include {
+            let full_pattern = if Path::new(pattern).is_absolute() {
+                PathBuf::from(pattern)
+            } else {
+                base_dir.join(pattern)
+            };
+            let pattern_str = full_pattern.to_string_lossy();
+            let is_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+
+            if is_glob {
+                let paths = glob::glob(&pattern_str)
+                    .map_err(|e| anyhow!("invalid include glob pattern '{}': {}", pattern, e))?;
+                for entry in paths {
+                    let p = entry.map_err(|e| anyhow!("error reading glob path: {}", e))?;
+                    if p.is_file() {
+                        matched_files.push(p);
+                    }
+                }
+            } else {
+                if !full_pattern.is_file() {
+                    bail!(
+                        "cannot read config file '{}' (included in '{}')",
+                        full_pattern.display(),
+                        base_dir.display()
+                    );
+                }
+                matched_files.push(full_pattern);
+            }
+        }
+
+        // Deterministic ordering: sort lexicographically
+        matched_files.sort();
+        matched_files.dedup();
+
+        for included_path in matched_files {
+            let canonical = included_path
+                .canonicalize()
+                .unwrap_or_else(|_| included_path.clone());
+            if !visited.insert(canonical) {
+                bail!("circular include detected: '{}'", included_path.display());
+            }
+
+            let raw = fs::read_to_string(&included_path).with_context(|| {
+                format!("cannot read config file '{}'", included_path.display())
+            })?;
+
+            let included: IncludedFile = deserialize_toml_with_field_context(&raw, &included_path)
+                .with_context(|| {
+                    format!("failed to parse config file '{}'", included_path.display())
+                })?;
+
+            self.loaded_files.push(included_path.clone());
+
+            for c in &included.contracts {
+                self.contract_files
+                    .insert(c.label.to_lowercase(), included_path.clone());
+            }
+
+            // Recursive include support
+            if !included.include.is_empty() {
+                let sub_base = included_path.parent().unwrap_or_else(|| Path::new("."));
+                let mut sub_cfg = AppConfig {
+                    include: included.include,
+                    ..Default::default()
+                };
+                sub_cfg.resolve_includes(sub_base, visited)?;
+                self.loaded_files.extend(sub_cfg.loaded_files);
+                self.contract_files.extend(sub_cfg.contract_files);
+                self.contracts.extend(sub_cfg.contracts);
+            }
+
+            self.contracts.extend(included.contracts);
+        }
+
+        Ok(())
     }
 
     /// The contract limit in force: `max_contracts`, else [`MAX_CONTRACTS`].
@@ -2054,6 +2617,11 @@ impl AppConfig {
             errors.push(e.to_string());
         }
 
+        // Validate poll_jitter_percent: 0–100 (#241)
+        if self.poll_jitter_percent > 100 {
+            errors.push("poll_jitter_percent must be between 0 and 100".to_owned());
+        }
+
         if self.http_pool_max_idle_per_host == 0
             || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
         {
@@ -2084,7 +2652,14 @@ impl AppConfig {
         }
 
         for contract in &mut self.contracts {
-            errors.extend(contract.collect_errors());
+            let contract_errors = contract.collect_errors();
+            if let Some(file) = self.contract_files.get(&contract.label.to_lowercase()) {
+                for err in contract_errors {
+                    errors.push(format!("{} (in {})", err, file.display()));
+                }
+            } else {
+                errors.extend(contract_errors);
+            }
         }
 
         match self.max_contracts {
@@ -2115,8 +2690,16 @@ impl AppConfig {
         let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
             let key = contract.label.to_lowercase();
-            if !seen.insert(key) && reported.insert(contract.label.clone()) {
-                errors.push(format!("duplicate contract label '{}'", contract.label));
+            if !seen.insert(key.clone()) && reported.insert(contract.label.clone()) {
+                if let Some(file) = self.contract_files.get(&key) {
+                    errors.push(format!(
+                        "duplicate contract label '{}' (in {})",
+                        contract.label,
+                        file.display()
+                    ));
+                } else {
+                    errors.push(format!("duplicate contract label '{}'", contract.label));
+                }
             }
         }
 
@@ -2127,13 +2710,19 @@ impl AppConfig {
         for contract in &self.contracts {
             let key = contract.cursor_key();
             if let Some(first_label) = seen_keys.get(&key).cloned() {
+                let origin = self
+                    .contract_files
+                    .get(&contract.label.to_lowercase())
+                    .map(|p| format!(" (in {})", p.display()))
+                    .unwrap_or_default();
                 errors.push(format!(
                     "duplicate contract_id '{}' on network '{}' (labels '{}' and '{}'); each \
-                     (network, contract_id) pair can be watched only once",
+                     (network, contract_id) pair can be watched only once{}",
                     contract.contract_id,
                     contract.network.as_str(),
                     first_label,
-                    contract.label
+                    contract.label,
+                    origin
                 ));
             } else {
                 seen_keys.insert(key, contract.label.clone());
@@ -2142,6 +2731,74 @@ impl AppConfig {
 
         ValidationErrors::into_result(errors)
     }
+}
+
+/// Computes a composite SHA-256 hash representing the content of the config file
+/// and all included files (resolved via `include` globs).
+/// Used by file watchers to detect changes across multi-file configurations.
+pub fn compute_config_hash(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut visited = std::collections::HashSet::new();
+    hash_config_recursive(path, &mut hasher, &mut visited)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn hash_config_recursive(
+    path: &Path,
+    hasher: &mut Sha256,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
+
+    let content =
+        fs::read(path).with_context(|| format!("cannot read config file '{}'", path.display()))?;
+
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(&content);
+
+    #[derive(Deserialize, Default)]
+    struct ConfigIncludesOnly {
+        #[serde(default)]
+        include: Vec<String>,
+    }
+
+    if let Ok(cfg) =
+        toml::from_str::<ConfigIncludesOnly>(std::str::from_utf8(&content).unwrap_or_default())
+    {
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut matched_files: Vec<PathBuf> = Vec::new();
+        for pattern in cfg.include {
+            let full_pattern = if Path::new(&pattern).is_absolute() {
+                PathBuf::from(pattern)
+            } else {
+                base_dir.join(pattern)
+            };
+            let pattern_str = full_pattern.to_string_lossy();
+            let is_glob =
+                pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[');
+            if is_glob {
+                if let Ok(paths) = glob::glob(&pattern_str) {
+                    for entry in paths.flatten() {
+                        if entry.is_file() {
+                            matched_files.push(entry);
+                        }
+                    }
+                }
+            } else if full_pattern.is_file() {
+                matched_files.push(full_pattern);
+            }
+        }
+        matched_files.sort();
+        matched_files.dedup();
+        for file in matched_files {
+            let _ = hash_config_recursive(&file, hasher, visited);
+        }
+    }
+
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2309,6 +2966,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "  ".into(),
             match_mode: Default::default(),
+            args: vec![],
         })];
         assert!(c.validate().is_err());
     }
@@ -2502,9 +3160,11 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
             concurrency: None,
             state_file: None,
+            ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
         let errors = &err.downcast_ref::<ValidationErrors>().unwrap().0;
@@ -2539,9 +3199,11 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
             concurrency: None,
             state_file: None,
+            ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -2557,9 +3219,11 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
             concurrency: None,
             state_file: None,
+            ..Default::default()
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2651,9 +3315,11 @@ mod tests {
                 http_connection_verbose: None,
                 max_contracts: None,
                 max_pages_per_cycle: None,
+                readiness_policy: Default::default(),
                 cursor_file: None,
                 concurrency: None,
                 state_file: None,
+                ..Default::default()
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -2691,9 +3357,11 @@ mod tests {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
             cursor_file: None,
             concurrency: None,
             state_file: None,
+            ..Default::default()
         }
     }
 
@@ -3017,6 +3685,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(33),
             match_mode: Default::default(),
+            args: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("contract 'Test'"), "got: {}", err);
@@ -3034,6 +3703,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(32),
             match_mode: Default::default(),
+            args: vec![],
         })];
         assert!(c.validate().is_ok());
     }
@@ -3045,6 +3715,7 @@ mod tests {
             c.rules = vec![rule(AlertRule::FunctionCalled {
                 function_name: name.into(),
                 match_mode: Default::default(),
+                args: vec![],
             })];
             let err = c.validate().unwrap_err().to_string();
             assert!(
@@ -3062,6 +3733,7 @@ mod tests {
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "withdraw ".into(),
             match_mode: Default::default(),
+            args: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("\"withdraw \""), "got: {}", err);
@@ -3646,6 +4318,7 @@ mod tests {
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
                         match_mode: FunctionMatchMode::default(),
+                        args: vec![],
                     },
                 },
                 RuleEntry {
@@ -4371,5 +5044,160 @@ mod tests {
         );
         assert!(err.contains("contracts[0].webhook_url"), "got: {}", err);
         assert!(err.contains("TXWATCH_TEST_MISSING"), "got: {}", err);
+    }
+
+    // ── Issue #244 & #245: Nested EventEmitted and NoActivity validation ───────
+
+    #[test]
+    fn rejects_no_activity_nested_in_all() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::All {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::FunctionCalled {
+                        function_name: "deposit".into(),
+                        match_mode: FunctionMatchMode::Exact,
+                        args: vec![],
+                    },
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: AlertRule::NoActivity { minutes: 10 },
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("NoActivity rule cannot be nested inside composite rules"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_no_activity_nested_in_any() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::Any {
+            rules: vec![RuleEntry {
+                rule: AlertRule::NoActivity { minutes: 5 },
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("NoActivity rule cannot be nested inside composite rules"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_no_activity_nested_in_not() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::Not {
+            rule: Box::new(RuleEntry {
+                rule: AlertRule::NoActivity { minutes: 5 },
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }),
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("NoActivity rule cannot be nested inside composite rules"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_no_activity_at_top_level() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::NoActivity { minutes: 15 })];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn needs_events_recurses_into_composite_rules() {
+        let event_rule = AlertRule::EventEmitted {
+            topic: "mint".into(),
+            topics: vec!["*".into()],
+        };
+        let not_event = AlertRule::Not {
+            rule: Box::new(RuleEntry {
+                rule: event_rule.clone(),
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }),
+        };
+        let all_event = AlertRule::All {
+            rules: vec![RuleEntry {
+                rule: not_event.clone(),
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }],
+        };
+        let any_event = AlertRule::Any {
+            rules: vec![
+                RuleEntry {
+                    rule: AlertRule::TransactionFailed,
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+                RuleEntry {
+                    rule: event_rule,
+                    enabled: true,
+                    webhook_url: None,
+                    webhook_secret: None,
+                    severity: None,
+                },
+            ],
+        };
+
+        assert!(not_event.needs_events());
+        assert!(all_event.needs_events());
+        assert!(any_event.needs_events());
+
+        let mut c = valid_contract();
+        c.rules = vec![rule(all_event)];
+        assert!(c.needs_events());
+    }
+
+    #[test]
+    fn validation_fails_when_nested_event_emitted_lacks_rpc_url() {
+        let mut c = valid_contract();
+        c.network = Network::Mainnet;
+        c.soroban_rpc_url = None;
+        c.rules = vec![rule(AlertRule::All {
+            rules: vec![RuleEntry {
+                rule: AlertRule::EventEmitted {
+                    topic: "mint".into(),
+                    topics: vec!["*".into()],
+                },
+                enabled: true,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+            }],
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("EventEmitted rules need a Soroban RPC endpoint"),
+            "got: {err}"
+        );
     }
 }

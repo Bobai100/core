@@ -471,7 +471,11 @@ async fn soroban_stream_omits_start_ledger_once_a_cursor_is_known() {
     serve_event_page(&server, "10-1", soroban_page(11..=11, "11-1")).await;
     serve_event_page(&server, "11-1", empty_soroban_page("11-1")).await;
     let file = cursor_file("soroban-cursor");
-    std::fs::write(&file, json!({ format!("testnet:{ID}"): "10-1" }).to_string()).unwrap();
+    std::fs::write(
+        &file,
+        json!({ format!("testnet:{ID}"): "10-1" }).to_string(),
+    )
+    .unwrap();
 
     txwatch_poller::run_once(
         config(&contract_toml("soroban", ID, "testnet"), &file, &[&server]),
@@ -493,7 +497,10 @@ async fn soroban_stream_omits_start_ledger_once_a_cursor_is_known() {
     assert!(!cursors.is_empty(), "expected at least one getEvents call");
     assert!(cursors.iter().all(|c| c.is_some()));
     assert!(
-        requested_start_ledgers(&server).await.iter().all(Option::is_none),
+        requested_start_ledgers(&server)
+            .await
+            .iter()
+            .all(Option::is_none),
         "startLedger must be omitted when a cursor is present"
     );
 }
@@ -525,7 +532,11 @@ async fn soroban_stream_advances_only_past_the_last_returned_event() {
     serve_event_page(&server, "10-1", soroban_page(11..=11, "11-1")).await;
     serve_event_page(&server, "11-1", empty_soroban_page("11-1")).await;
     let file = cursor_file("soroban-watermark");
-    std::fs::write(&file, json!({ format!("testnet:{ID}"): "10-1" }).to_string()).unwrap();
+    std::fs::write(
+        &file,
+        json!({ format!("testnet:{ID}"): "10-1" }).to_string(),
+    )
+    .unwrap();
 
     txwatch_poller::run_once(
         config(&contract_toml("soroban", ID, "testnet"), &file, &[&server]),
@@ -577,7 +588,11 @@ async fn soroban_stream_paginates_across_multiple_pages() {
     serve_event_page(&server, "11-1", soroban_page(12..=12, "12-1")).await;
     serve_event_page(&server, "12-1", empty_soroban_page("12-1")).await;
     let file = cursor_file("soroban-multi-page");
-    std::fs::write(&file, json!({ format!("testnet:{ID}"): "10-1" }).to_string()).unwrap();
+    std::fs::write(
+        &file,
+        json!({ format!("testnet:{ID}"): "10-1" }).to_string(),
+    )
+    .unwrap();
 
     txwatch_poller::run_once(
         config(&contract_toml("soroban", ID, "testnet"), &file, &[&server]),
@@ -623,7 +638,10 @@ async fn held_lock_makes_a_second_instance_fail_fast() {
         .collect();
     assert_eq!(cursors, vec!["10-1", "11-1", "12-1"]);
     assert!(
-        requested_start_ledgers(&server).await.iter().all(Option::is_none),
+        requested_start_ledgers(&server)
+            .await
+            .iter()
+            .all(Option::is_none),
         "startLedger must be omitted on every cursor-based page"
     );
     let saved = read_cursors(&file);

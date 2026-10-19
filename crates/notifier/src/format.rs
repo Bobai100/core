@@ -56,7 +56,7 @@ pub fn render_batch_body(
     routing_key: Option<&str>,
 ) -> Result<String> {
     let body = match format {
-        WebhookFormat::Txwatch => serde_json::to_value(payloads)?,
+        WebhookFormat::Txwatch | WebhookFormat::Template => serde_json::to_value(payloads)?,
         WebhookFormat::Slack => slack_digest(payloads),
         WebhookFormat::Discord => discord_digest(payloads),
         WebhookFormat::Pagerduty => {
@@ -381,7 +381,11 @@ mod tests {
             function_name: Some("transfer".into()),
             function_names: vec!["transfer".into()],
             amount_xlm: Some(15000),
+            amount_stroops: Some(150_000_000_000),
+            amount_xlm_decimal: None,
             fee_charged_stroops: Some(50000),
+            source_account: None,
+            severity: None,
             timestamp: 1705320000,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
@@ -393,6 +397,9 @@ mod tests {
             severity: None,
             ledger: None,
             source_account: None,
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            ledger: None,
             memo: None,
             memo_type: None,
             operation_count: None,
@@ -409,6 +416,11 @@ mod tests {
     fn render(format: WebhookFormat, payload: &AlertPayload) -> Value {
         serde_json::from_str(&render_body(format, payload, Some("R0UT1NGKEY"), None).unwrap())
             .unwrap()
+    }
+
+    #[allow(dead_code)]
+    fn snapshot(expected: &str) -> Value {
+        serde_json::from_str(expected).expect("snapshot is valid JSON")
     }
 
     #[test]
