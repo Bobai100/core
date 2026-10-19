@@ -1140,6 +1140,21 @@ pub(crate) struct TransactionPage {
     pub(crate) next_cursor: Option<String>,
 }
 
+/// Outcome of one [`TransactionSource::fetch_page`] call.
+///
+/// A rate-limited response is kept distinct from an empty page (issue #271):
+/// treating it as "no new transactions" would report a successful poll, reset
+/// the failure streak, advance freshness metrics and let `NoActivity` fire a
+/// false "contract went quiet" alert while TxWatch is actually throttled.
+pub(crate) enum FetchOutcome {
+    /// A page of transactions (possibly empty).
+    Page(TransactionPage),
+    /// The source cannot serve this contract at all.
+    Unsupported,
+    /// Horizon answered HTTP 429; retry after `retry_after`.
+    RateLimited { retry_after: Duration },
+}
+
 /// Where a contract's transactions come from.
 ///
 /// Only [`HorizonSource`] exists today. Soroban RPC cannot implement this as it
@@ -1150,13 +1165,15 @@ pub(crate) struct TransactionPage {
 pub(crate) trait TransactionSource {
     /// Fetch the page of transactions after `cursor`, oldest first.
     ///
-    /// Returning `Ok(None)` means the source cannot serve this contract at all
-    /// (for example a Horizon account endpoint rejecting a contract address).
+    /// [`FetchOutcome::Unsupported`] means the source cannot serve this contract
+    /// at all (for example a Horizon account endpoint rejecting a contract
+    /// address). [`FetchOutcome::RateLimited`] means the source asked us to back
+    /// off; the caller is responsible for sleeping so shutdown stays responsive.
     async fn fetch_page(
         &self,
         contract: &WatchedContract,
         cursor: &str,
-    ) -> Result<Option<TransactionPage>>;
+    ) -> Result<FetchOutcome>;
 }
 
 /// Horizon's transaction collection endpoint.
@@ -1248,13 +1265,14 @@ impl TransactionSource for HorizonSource<'_> {
         &self,
         contract: &WatchedContract,
         cursor: &str,
-    ) -> Result<Option<TransactionPage>> {
+    ) -> Result<FetchOutcome> {
         // Issue #2: `include_failed=true` is required or Horizon only returns
         // successful transactions, which makes `TransactionFailed` dead.
-        // Issue #23: `join=operations` returns operations inline, avoiding one
-        // HTTP request per transaction.
+        // Issue #273: `join=operations` is not sent — Horizon ignores it on the
+        // transactions endpoint (only `join=transactions` exists, on operation
+        // collections), so operations are fetched per transaction instead.
         let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit={}&join=operations&include_failed=true",
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit={}&include_failed=true",
             self.base_url, contract.contract_id, cursor, self.limit
         );
 
@@ -1269,6 +1287,9 @@ impl TransactionSource for HorizonSource<'_> {
         let response = response.with_context(|| format!("GET {} failed", url))?;
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Issue #271/#272: report the throttle instead of sleeping here and
+            // returning an empty page. The caller backs off so it can still
+            // observe shutdown/reload while waiting.
             let retry_after = response
                 .headers()
                 .get("Retry-After")
@@ -1279,13 +1300,13 @@ impl TransactionSource for HorizonSource<'_> {
                 retry_after = ?retry_after,
                 requested_delay = ?requested_delay,
                 applied_delay_secs = applied_delay.as_secs(),
-                "Horizon returned 429 — backing off"
+                "Horizon returned 429 — rate limited"
             );
-            tokio::time::sleep(applied_delay).await;
-            return Ok(Some(TransactionPage {
-                records: Vec::new(),
-                next_cursor: None,
-            }));
+            #[cfg(feature = "metrics")]
+            metrics::inc_horizon_rate_limited(contract.network.as_str());
+            return Ok(FetchOutcome::RateLimited {
+                retry_after: applied_delay,
+            });
         }
 
         let status = response.status();
@@ -1305,7 +1326,7 @@ impl TransactionSource for HorizonSource<'_> {
 
         let records = page._embedded.records;
         if records.is_empty() {
-            return Ok(Some(TransactionPage {
+            return Ok(FetchOutcome::Page(TransactionPage {
                 records,
                 next_cursor: None,
             }));
@@ -1316,7 +1337,7 @@ impl TransactionSource for HorizonSource<'_> {
         } else {
             records.last().map(|r| r.tx.paging_token.clone())
         };
-        Ok(Some(TransactionPage {
+        Ok(FetchOutcome::Page(TransactionPage {
             records,
             next_cursor,
         }))
@@ -1392,14 +1413,16 @@ async fn ledger_lag(
 
 /// Returns `(transactions_processed, alerts_fired, webhook_failures, transactions_skipped)`.
 ///
-/// Uses `join=operations` on the transactions endpoint so that Horizon returns
-/// operations inline, eliminating one HTTP request per transaction (#23).
-/// Falls back to a separate `/transactions/{hash}/operations` fetch only when
-/// the inline `operations` array is absent (older Horizon versions).
+/// Operations are fetched per transaction via `/transactions/{hash}/operations`
+/// because Horizon ignores `join=operations` on the transactions endpoint
+/// (#273). Inline `operations` are used when a source provides them.
 ///
 /// Pages are processed as they arrive rather than buffered, and at most
 /// `max_pages` pages (200 transactions each) are fetched per call. When the cap
 /// is hit a warning is logged and the next call resumes from the saved cursor.
+///
+/// A rate-limited (HTTP 429) response is returned as an error so the caller
+/// does not count the poll as successful (issue #271).
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(client, source, contract, cursors, state, cooldowns), fields(
     contract    = %contract.label,
@@ -1433,70 +1456,24 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     let mut page_cursor = cursor.clone();
 
     loop {
-        let Some(page) = source.fetch_page(contract, &page_cursor).await? else {
-            warn!(
-                contract = %contract.label,
-                "no transaction source can serve this contract; see issue #4"
-            );
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
-        // Issue #2: `include_failed=true` is required or Horizon only returns
-        // successful transactions, which makes `TransactionFailed` dead.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations&include_failed=true",
-        // Checked against horizon-testnet.stellar.org: `join=operations` on the
-        // transactions endpoint is NOT supported. Horizon answers 200 but ignores
-        // it and returns no `operations` array (only `join=transactions` exists,
-        // on operation/payment/effect collections). Operations are therefore
-        // fetched per transaction; see `fetch_soroban_details`.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200",
-            poll_base, contract.contract_id, page_cursor
-        );
-
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let response = client.get(&url).send().await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_horizon_request(
-            contract.network.as_str(),
-            started.elapsed().as_secs_f64(),
-        );
-        let response = response.with_context(|| format!("GET {} failed", url))?;
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0, 0));
-        }
-
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "contract not found on {} (404): {}",
-                contract.network.as_str(),
-                truncate_response_body(&body)
-            ));
-        }
-        if !status.is_success() {
-            return Err(horizon_response_error(response, &url).await);
-        }
-
-        let page: HorizonPage = response
-            .json()
-            .await
-            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
-        if records.is_empty() {
-            break;
+        let page = match source.fetch_page(contract, &page_cursor).await? {
+            FetchOutcome::Page(page) => page,
+            FetchOutcome::Unsupported => {
+                warn!(
+                    contract = %contract.label,
+                    "no transaction source can serve this contract; see issue #4"
+                );
+                break;
+            }
+            FetchOutcome::RateLimited { retry_after } => {
+                // Issue #271: a 429 is not a successful empty poll. Surface it as
+                // an error so the failure streak, readiness and freshness metrics
+                // are not advanced and `NoActivity` cannot fire a false alert.
+                return Err(anyhow::anyhow!(
+                    "Horizon rate limited the poll (429); retry after {}s",
+                    retry_after.as_secs()
+                ));
+            }
         };
         if page.records.is_empty() {
             break;
@@ -1551,11 +1528,27 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         }
 
         let page = match source.fetch_page(contract, &page_cursor).await {
-            Ok(Some(page)) => page,
-            Ok(None) => {
+            Ok(FetchOutcome::Page(page)) => page,
+            Ok(FetchOutcome::Unsupported) => {
                 warn!(
                     contract = %contract.label,
                     "no transaction source can serve this contract; see issue #4"
+                );
+                break;
+            }
+            Ok(FetchOutcome::RateLimited { retry_after }) => {
+                // Issue #271: never treat a 429 as a successful empty poll.
+                let error = anyhow::anyhow!(
+                    "Horizon rate limited the poll (429); retry after {}s",
+                    retry_after.as_secs()
+                );
+                if pages_fetched == 0 {
+                    return Err(error);
+                }
+                warn!(
+                    contract = %contract.label,
+                    error = %error,
+                    "failed to fetch a later page; continuing from the saved cursor next cycle"
                 );
                 break;
             }
@@ -1591,9 +1584,12 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             // op enrichment fails.
             cursors.insert(cursor_key.clone(), paging_token.clone());
 
-            // Issue #23: if Horizon returned inline operations, use them directly.
-            // Otherwise fall back to a separate /operations fetch.
+            // Issue #273: `join=operations` is ignored by Horizon, so operations
+            // are fetched per transaction. Inline operations are still honoured
+            // if a source ever provides them.
             let details = if !record.operations.is_empty() {
+                debug!(contract = %contract.label, tx = %tx_hash, "using inline operations");
+                extract_soroban_details(record.operations)
                 debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
                 extract_soroban_details(record.operations.clone(), &contract.contract_id).map(
                     |mut details| {

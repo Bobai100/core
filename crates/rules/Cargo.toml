@@ -13,8 +13,6 @@ categories.workspace = true
 
 [features]
 default = []
-# Enables decoding of Soroban envelope_xdr / result_xdr via the stellar-xdr crate.
-soroban-xdr = ["dep:stellar-xdr"]
 # Exposes internal parsers to the fuzz targets in `fuzz/`. Not a public API.
 fuzzing = []
 
@@ -29,10 +27,6 @@ tracing        = { workspace = true }
 # only by tests.
 sha2           = { workspace = true }
 hex            = { workspace = true }
-# Backs the `soroban-xdr` feature. It has to be a real optional dependency
-# rather than a dev-dependency, because a dev-dependency cannot be optional and
-# the feature references it with `dep:`.
-stellar-xdr    = { version = "26", optional = true, default-features = false, features = ["std", "curr"] }
 
 [dev-dependencies]
 proptest   = "1"

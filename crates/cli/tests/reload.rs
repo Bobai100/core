@@ -1,4 +1,8 @@
 //! SIGHUP config reload for `txwatch watch`. Closes #98.
+//!
+//! SIGHUP is a Unix-only signal (the CLI installs a no-op handler on other
+//! platforms), so this whole test binary is gated to Unix and is skipped on
+//! Windows. macOS is Unix and does run it.
 #![cfg(unix)]
 
 use std::{
@@ -105,7 +109,12 @@ fn mock_horizon(contract_id: &str) -> (String, thread::JoinHandle<()>) {
 
 #[test]
 fn watch_reloads_config_on_sighup_and_keeps_old_config_when_invalid() {
-    let path = env::temp_dir().join("txwatch_sighup_reload.toml");
+    // Unique per-process file name so concurrent test runs (or a stale file
+    // from a previous run) can't interfere, and so the path is portable.
+    let path = env::temp_dir().join(format!(
+        "txwatch_sighup_reload_{}.toml",
+        std::process::id()
+    ));
     fs::write(
         &path,
         format!("poll_interval_seconds = 10\n{}", contract("Alpha", ALPHA)),
@@ -165,9 +174,28 @@ fn watch_reloads_config_on_sighup_and_keeps_old_config_when_invalid() {
 
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(&path);
 }
 
 #[test]
+fn watch_reload_keeps_horizon_url_override() {
+    let path = env::temp_dir().join("txwatch_sighup_horizon_override.toml");
+    fs::write(
+        &path,
+        format!("poll_interval_seconds = 10\n{}", contract("Alpha", ALPHA)),
+    )
+    .unwrap();
+
+    let override_url = "http://127.0.0.1:1";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "--horizon-url",
+            override_url,
+            "watch",
+            "--dry-run",
+        ])
 fn watch_reload_preserves_cooldowns() {
     let (horizon_url, _server) = mock_horizon(ALPHA);
     let path = env::temp_dir().join("txwatch_sighup_cooldown.toml");
@@ -255,6 +283,13 @@ fn watch_reload_migrates_cursor_file_path() {
 
     wait_for(&lines, "TxWatch polling engine started");
 
+    // Rewrite the config with an extra contract and reload via SIGHUP.
+    fs::write(
+        &path,
+        format!(
+            "poll_interval_seconds = 10\n{}{}",
+            contract("Alpha", ALPHA),
+            contract("Beta", BETA)
     // Change the cursor path and reload.
     fs::write(
         &path,
@@ -266,6 +301,24 @@ fn watch_reload_migrates_cursor_file_path() {
     )
     .unwrap();
     sighup(&child);
+    let reloaded = wait_for(&lines, "configuration reloaded");
+    assert!(reloaded.contains("contracts=2"), "{}", reloaded);
+
+    // The override must survive the reload: the reloaded contract must still
+    // point at the sentinel URL rather than the public Horizon.
+    let effective = wait_for(&lines, override_url);
+    assert!(
+        !effective.contains("horizon.stellar.org"),
+        "override dropped on reload: {}",
+        effective
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "watcher must still be running"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
     wait_for(&lines, "configuration reloaded");
 
     // Give the watcher a moment to flush cursors on the next generation.

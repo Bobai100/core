@@ -2876,6 +2876,28 @@ mod tests {
     }
 
     #[test]
+    fn from_file_returns_err_for_syntactically_invalid_toml() {
+        let path = std::env::temp_dir().join("txwatch_invalid_syntax_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]
+            label = "x"
+        "#;
+
+        std::fs::write(&path, raw).unwrap();
+        let result = AppConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        let error_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            error_msg.contains("txwatch_invalid_syntax_test_config.toml"),
+            "error should name the file path, got: {}",
+            error_msg
+        );
+    }
+
+    #[test]
     fn from_file_returns_err_for_wrong_type_field() {
         let path = std::env::temp_dir().join("txwatch_wrong_type_field_test_config.toml");
         let raw = r#"

@@ -47,7 +47,7 @@ struct Cli {
     log_format: LogFormat,
 
     /// Override the Horizon base URL for every contract (e.g. a private Horizon instance)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_horizon_url)]
     horizon_url: Option<String>,
 
     #[command(subcommand)]
@@ -64,6 +64,27 @@ enum LogFormat {
 enum OutputFormat {
     Text,
     Json,
+}
+
+/// Network names accepted by `test-webhook --network`. `public` and `pubnet`
+/// are the names Stellar Expert uses for mainnet.
+#[derive(Clone, Copy, ValueEnum)]
+enum NetworkArg {
+    Mainnet,
+    #[value(alias = "public", alias = "pubnet")]
+    MainnetAlias,
+    Testnet,
+    Futurenet,
+}
+
+impl NetworkArg {
+    fn to_network(self) -> txwatch_config::Network {
+        match self {
+            NetworkArg::Mainnet | NetworkArg::MainnetAlias => txwatch_config::Network::Mainnet,
+            NetworkArg::Testnet => txwatch_config::Network::Testnet,
+            NetworkArg::Futurenet => txwatch_config::Network::Futurenet,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -121,8 +142,17 @@ enum Command {
         #[arg(long, default_value = "TxWatch Test")]
         label: String,
 
-        #[arg(long, default_value = "testnet")]
-        network: String,
+        /// Stellar network for the test payload
+        #[arg(long, value_enum, default_value = "testnet")]
+        network: NetworkArg,
+
+        /// Horizon base URL for a custom network in the test payload
+        #[arg(long, value_parser = parse_horizon_url)]
+        horizon_url: Option<String>,
+
+        /// Explorer base URL for a custom network in the test payload
+        #[arg(long, value_parser = parse_horizon_url)]
+        explorer_url: Option<String>,
 
         /// Send to every destination of this configured contract instead of --url
         #[arg(long)]
@@ -386,7 +416,7 @@ async fn main() -> Result<()> {
                 for entry in &c.rules {
                     println!("      - {}", entry.rule.label());
                 }
-                println!("    horizon      : {}", c.network.horizon_base_url());
+                println!("    horizon      : {}", poll_base_url(c));
                 match c.network.explorer_base_url() {
                     Some(explorer) => {
                         println!("    explorer     : {}/contract/{}", explorer, c.contract_id)
@@ -472,6 +502,8 @@ async fn main() -> Result<()> {
             url,
             label,
             network,
+            horizon_url,
+            explorer_url,
             contract,
             secret,
             format,
@@ -482,29 +514,27 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|wanted| {
                     let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
-                    cfg.contracts
-                        .into_iter()
-                        .find(|c| c.label == *wanted)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("configured contract '{}' not found", wanted)
-                        })
+                    find_contract_by_label(&cfg, wanted)
                 })
                 .transpose()?;
-            let (destinations, network) = if let Some(c) = configured {
+            let (destinations, network, horizon, explorer) = if let Some(c) = configured {
                 let mut destinations = c.destinations();
                 if secret.is_some() {
                     for destination in &mut destinations {
                         destination.secret = secret.clone();
                     }
                 }
-                (destinations, c.network)
+                let horizon = poll_base_url(&c).to_string();
+                let explorer = c.network.explorer_base_url().map(str::to_string);
+                (destinations, c.network, horizon, explorer)
             } else {
-                let selected = match network.as_str() {
-                    "mainnet" => txwatch_config::Network::Mainnet,
-                    "testnet" => txwatch_config::Network::Testnet,
-                    "futurenet" => txwatch_config::Network::Futurenet,
-                    other => return Err(anyhow::anyhow!("unknown network '{}'", other)),
-                };
+                let selected = network.to_network();
+                let horizon = horizon_url
+                    .clone()
+                    .unwrap_or_else(|| selected.horizon_base_url().to_string());
+                let explorer = explorer_url
+                    .clone()
+                    .or_else(|| selected.explorer_base_url().map(str::to_string));
                 let destination = WebhookDestination {
                     url: url.ok_or_else(|| {
                         anyhow::anyhow!("--url is required unless --contract is provided")
@@ -516,7 +546,7 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 };
                 destination.validate()?;
-                (vec![destination], selected)
+                (vec![destination], selected, horizon, explorer)
             };
             let client = build_client().context("failed to build HTTP client")?;
 
@@ -526,8 +556,8 @@ async fn main() -> Result<()> {
                 let payload = test_payload_with_network(
                     &label,
                     network.as_str(),
-                    network.horizon_base_url(),
-                    network.explorer_base_url(),
+                    &horizon,
+                    explorer.as_deref(),
                 );
                 info!(url = %destination.url, format = %destination.format, "sending test webhook");
                 match send_to_destination_simple(&client, destination, &payload).await {
@@ -657,6 +687,17 @@ async fn main() -> Result<()> {
             // #227: use create_new(true) to avoid TOCTOU race, unless --force
             write_config_file(output, &raw, force)?;
 
+            // Write to a sibling temp file and rename over the target so an
+            // interrupted write never leaves a truncated config. `fs::rename`
+            // replaces an existing file atomically on Unix and on Windows
+            // (via MoveFileEx with MOVEFILE_REPLACE_EXISTING).
+            let tmp = output.with_extension("toml.tmp");
+            fs::write(&tmp, raw)
+                .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+            fs::rename(&tmp, output).with_context(|| {
+                let _ = fs::remove_file(&tmp);
+                format!("failed to write '{}'", output.display())
+            })?;
             println!(
                 "Wrote {}. Check it with: txwatch --config {} validate",
                 output.display(),
@@ -687,11 +728,7 @@ async fn main() -> Result<()> {
             send,
         } => {
             let cfg = load_config(&cli)?;
-            let contract = cfg
-                .contracts
-                .into_iter()
-                .find(|c| c.label == *contract)
-                .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract))?;
+            let contract = find_contract_by_label(&cfg, contract)?;
             let client = build_client().context("failed to build HTTP client")?;
 
             let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
@@ -797,22 +834,20 @@ async fn main() -> Result<()> {
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    warn!(error = ?e, "failed to install Ctrl+C handler");
-                    return;
-                }
-                let _ = shutdown_tx.send(true);
-            });
+            spawn_signal_handlers(shutdown_tx);
 
             #[cfg(feature = "metrics")]
             if let Some(addr) = metrics_addr {
                 // Register before serving so the first scrape already has it.
-                txwatch_poller::metrics::register_build_info();
+                txwatch_poller::metrics::register_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    env!("TXWATCH_GIT_SHA"),
+                );
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
+            // On Unix this installs a SIGHUP handler; on Windows it is a no-op.
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
-            spawn_reload_on_sighup(config_path, reload_tx)?;
+            spawn_reload_on_sighup(config_path, cli.horizon_url.clone(), reload_tx)?;
 
             info!(
                 version = VERSION,
@@ -1014,11 +1049,75 @@ fn required_config(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Forward SIGINT, SIGTERM and SIGQUIT into `shutdown_tx` so containers and
+/// systemd (`docker stop`, Kubernetes) shut down cleanly. A second SIGINT
+/// forces an immediate exit.
+#[cfg(unix)]
+fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGINT handler");
+            return;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGTERM handler");
+            return;
+        }
+    };
+    let mut sigquit = match signal(SignalKind::quit()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGQUIT handler");
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let mut shutting_down = false;
+        loop {
+            let is_sigint = tokio::select! {
+                _ = sigint.recv() => true,
+                _ = sigterm.recv() => false,
+                _ = sigquit.recv() => false,
+            };
+            if shutting_down {
+                if is_sigint {
+                    error!("second SIGINT received — exiting immediately, state may not be flushed");
+                    std::process::exit(130);
+                }
+                continue;
+            }
+            shutting_down = true;
+            info!("shutting down, press Ctrl-C again to force");
+            let _ = shutdown_tx.send(true);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = ?e, "failed to install Ctrl+C handler");
+            return;
+        }
+        info!("shutting down, press Ctrl-C again to force");
+        let _ = shutdown_tx.send(true);
+    });
+}
+
 /// On SIGHUP, re-read and validate the config file and hand it to the poller.
 /// An invalid file is logged and ignored, so the previous config keeps running.
 #[cfg(unix)]
 fn spawn_reload_on_sighup(
     path: PathBuf,
+    horizon_url: Option<String>,
     reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -1027,7 +1126,7 @@ fn spawn_reload_on_sighup(
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
             info!(path = %path.display(), "SIGHUP received — reloading config");
-            if let Some(cfg) = reload_config(&path) {
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
                 if reload_tx.send(cfg).await.is_err() {
                     break;
                 }
@@ -1037,18 +1136,32 @@ fn spawn_reload_on_sighup(
     Ok(())
 }
 
+/// Windows has no SIGHUP, so config reloading is a no-op there. The poller
+/// still runs normally; restart the process to pick up a changed config.
 #[cfg(not(unix))]
 fn spawn_reload_on_sighup(
     _path: PathBuf,
+    _horizon_url: Option<String>,
     _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
+    info!("SIGHUP config reload is not supported on this platform; restart to reload");
     Ok(())
 }
 
+/// Re-read and validate the config file. Only used by the Unix SIGHUP handler,
+/// so it is dead code on other platforms.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn reload_config(path: &Path) -> Option<AppConfig> {
+fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
-        Ok(cfg) => Some(cfg),
+        Ok(mut cfg) => {
+            if let Some(url) = horizon_url {
+                let url = url.trim_end_matches('/');
+                for c in &mut cfg.contracts {
+                    c.horizon_base_url_override = Some(url.to_string());
+                }
+            }
+            Some(cfg)
+        }
         Err(e) => {
             error!(error = %format!("{:#}", e), "config reload failed — keeping the previous config");
             None
@@ -1113,6 +1226,57 @@ fn load_config(cli: &Cli) -> Result<AppConfig> {
     Ok(cfg)
 }
 
+/// The Horizon base URL actually used to poll `contract`: the per-contract
+/// override (including `--horizon-url`) when set, otherwise the network default.
+fn poll_base_url(contract: &txwatch_config::WatchedContract) -> &str {
+    contract
+        .horizon_base_url_override
+        .as_deref()
+        .unwrap_or_else(|| contract.network.horizon_base_url())
+}
+
+/// Find a configured contract by label, matching case-insensitively after
+/// trimming (config validation treats such labels as duplicates). On a miss the
+/// error lists the configured labels.
+fn find_contract_by_label(
+    cfg: &AppConfig,
+    wanted: &str,
+) -> Result<txwatch_config::WatchedContract> {
+    let wanted = wanted.trim();
+    cfg.contracts
+        .iter()
+        .find(|c| c.label.trim().eq_ignore_ascii_case(wanted))
+        .cloned()
+        .ok_or_else(|| {
+            let labels: Vec<&str> = cfg.contracts.iter().map(|c| c.label.as_str()).collect();
+            if labels.is_empty() {
+                anyhow::anyhow!(
+                    "configured contract '{}' not found (no contracts are configured)",
+                    wanted
+                )
+            } else {
+                anyhow::anyhow!(
+                    "configured contract '{}' not found; configured labels: {}",
+                    wanted,
+                    labels.join(", ")
+                )
+            }
+        })
+}
+
+/// Validate a `--horizon-url` / `--explorer-url` value: it must be an absolute
+/// http(s) URL. Trailing slashes are trimmed so the stored value is canonical.
+fn parse_horizon_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("URL must not be empty".to_string());
+    }
+    if let Err(e) = txwatch_config::check_http_url(trimmed) {
+        return Err(format!("invalid URL '{}': {:#}", value, e));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Machine-readable `validate` summary. Webhook secrets are never printed;
 /// only whether one is set.
 fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
@@ -1120,15 +1284,27 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
         .contracts
         .iter()
         .map(|c| {
-            let rules: Vec<_> = c.rules.iter().map(|entry| {
-                let mut obj = serde_json::to_value(&entry.rule)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                let map = obj.as_object_mut().unwrap();
-                if let Some(cooldown) = entry.cooldown_seconds {
-                    map.insert("cooldown_seconds".to_string(), serde_json::json!(cooldown));
-                }
-                serde_json::Value::Object(map.clone())
-            }).collect();
+            let rules: Vec<_> = c
+                .rules
+                .iter()
+                .map(|entry| {
+                    let mut obj = serde_json::to_value(&entry.rule)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(cooldown) = entry.cooldown_seconds {
+                        if let Some(map) = obj.as_object_mut() {
+                            map.insert(
+                                "cooldown_seconds".to_string(),
+                                serde_json::json!(cooldown),
+                            );
+                        }
+                    }
+                    obj
+                })
+                .collect();
+            let horizon_url = c
+                .horizon_base_url_override
+                .as_deref()
+                .unwrap_or_else(|| c.network.horizon_base_url());
             serde_json::json!({
                 "label": c.label,
                 "contract_id": c.contract_id,
@@ -1138,12 +1314,9 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "webhook_url": c.webhook_url,
                 "webhook_secret_set": c.webhook_secret.is_some(),
                 "rules": rules,
-                "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url().unwrap_or(""), c.contract_id),
-                "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
-                "rules": c.rules,
-                "horizon_url": c.network.horizon_base_url(),
+                "horizon_url": horizon_url,
                 "explorer_url": c.network.explorer_base_url().map(|e| format!("{}/contract/{}", e, c.contract_id)),
+                "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -1270,10 +1443,7 @@ async fn check_horizon_contract(
     client: &Client,
     contract: &txwatch_config::WatchedContract,
 ) -> HorizonCheck {
-    let base = contract
-        .horizon_base_url_override
-        .as_deref()
-        .unwrap_or_else(|| contract.network.horizon_base_url());
+    let base = poll_base_url(contract);
     let root = client.get(base).send().await;
     let (reachable, latest_ledger) = match root {
         Ok(response) if response.status().is_success() => {

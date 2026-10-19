@@ -100,6 +100,10 @@ async fn mocked_poll_is_reflected_in_metrics_endpoint() {
         body.contains("txwatch_horizon_request_duration_seconds_count"),
         "{body}"
     );
+    assert!(
+        body.contains("txwatch_horizon_rate_limited_total"),
+        "{body}"
+    );
 
     let ready = reqwest::get(format!("http://{addr}/readyz")).await.unwrap();
     assert_eq!(ready.status(), 200);
@@ -108,6 +112,18 @@ async fn mocked_poll_is_reflected_in_metrics_endpoint() {
 }
 
 #[tokio::test]
+async fn horizon_rate_limit_is_reflected_in_metrics_endpoint() {
+    let horizon = MockServer::start().await;
+
+    // Every Horizon page request is rate limited.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&horizon)
+        .await;
+
+    let mut contract = helpers::contract("http://127.0.0.1:1/hook", vec![AlertRule::AnyTransaction]);
+    contract.label = "Rate Limited Contract".into();
 async fn operations_fetch_failure_is_reflected_in_degraded_metric() {
     let horizon = MockServer::start().await;
     let receiver = MockServer::start().await;
@@ -182,6 +198,7 @@ async fn reload_removes_series_of_dropped_contracts() {
     let (poller_tx, poller_rx) = watch::channel(false);
     poller_tx.send(true).unwrap();
     tokio::time::timeout(
+        Duration::from_secs(10),
         Duration::from_secs(30),
         txwatch_poller::run_with_shutdown(cfg, false, poller_rx),
     )
@@ -195,6 +212,16 @@ async fn reload_removes_series_of_dropped_contracts() {
         .text()
         .await
         .unwrap();
+    let labels = r#"{contract="Rate Limited Contract",network="testnet"}"#;
+    assert!(
+        body.contains(&format!("txwatch_horizon_rate_limited_total{labels} 1")),
+        "{body}"
+    );
+    // A rate-limited poll must not be reported as a successful poll.
+    assert!(
+        body.contains(&format!("txwatch_consecutive_poll_failures{labels} 1")),
+        "{body}"
+    );
     let labels = r#"{contract="Degraded Test Contract",network="testnet"}"#;
     assert!(
         body.contains(&format!("txwatch_transactions_degraded_total{labels} 1")),

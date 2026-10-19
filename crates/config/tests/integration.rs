@@ -56,6 +56,17 @@ fn broken_toml_fixture_fails_with_meaningful_error() {
     );
 }
 
+#[test]
+fn invalid_syntax_toml_fixture_reports_file_path() {
+    let path = crate_fixture_path("invalid-syntax.toml");
+    let err = AppConfig::from_file(&path).expect_err("invalid TOML fixture should fail");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("invalid-syntax.toml"),
+        "expected the error to include the file path, got: {}",
+        msg
+    );
 fn write_temp_config(name: &str, contents: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "txwatch-config-it-{}-{}",

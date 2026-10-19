@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![warn(missing_docs)]
 
 //! txwatch-rules evaluates `AlertRule` conditions against enriched Stellar transactions
 //! and constructs structured `AlertPayload` webhook bodies.
@@ -47,9 +48,13 @@ fn sanitize_stroops(value: Option<u64>, field: &str, tx_hash: &str) -> Option<u6
 /// Raw Horizon transaction record as returned by the REST API.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HorizonTransaction {
+    /// Transaction hash.
     pub hash: String,
+    /// Ledger close time as an RFC 3339 string.
     pub created_at: String, // RFC 3339
+    /// Whether the transaction succeeded.
     pub successful: bool,
+    /// Horizon paging token for this record.
     pub paging_token: String,
     /// Fee charged in stroops (Horizon returns this as a string).
     pub fee_charged: Option<String>,
@@ -65,7 +70,6 @@ pub struct HorizonTransaction {
     // ── Issue #56: additional Horizon fields ──────────────────────────────────
     /// Ledger sequence number in which this transaction was included.
     pub ledger: Option<u32>,
-    /// Source account address (G-address) of the transaction.
     /// Memo content as a string (may be absent for `MemoNone`).
     pub memo: Option<String>,
     /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
@@ -83,7 +87,10 @@ pub struct HorizonTransaction {
 pub struct ContractEvent {
     /// Contract that emitted the event.
     pub contract_id: String,
+    /// Event topics as JSON-encoded `ScVal`s; topic 0 is conventionally the
+    /// event name symbol.
     pub topics: Vec<Value>,
+    /// Event body as a JSON-encoded `ScVal`.
     pub data: Value,
 }
 
@@ -264,9 +271,13 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
 /// stays pure and testable without network calls.
 #[derive(Debug, Clone)]
 pub struct EnrichedTransaction {
+    /// Transaction hash.
     pub hash: String,
+    /// Ledger close time of the transaction.
     pub timestamp: DateTime<Utc>,
+    /// Whether the transaction succeeded.
     pub successful: bool,
+    /// Horizon paging token for this record.
     pub paging_token: String,
     /// All Soroban contract functions invoked in this transaction (may be multiple).
     pub function_names: Vec<String>,
@@ -284,7 +295,6 @@ pub struct EnrichedTransaction {
     // ── Issue #56: additional metadata fields ─────────────────────────────────
     /// Ledger sequence number in which this transaction was included.
     pub ledger: Option<u32>,
-    /// Source account address (G-address) of the transaction.
     /// Memo content (absent for `MemoNone`).
     pub memo: Option<String>,
     /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
@@ -448,16 +458,18 @@ pub struct AlertPayload {
     /// Stable, deterministic alert identifier derived from
     /// (network, contract_id, tx hash, rule_type, rule params) via SHA-256
     /// (issue #57). Receivers should deduplicate on this value.
-    /// Stable identifier of this alert (see [`alert_id`]): the same contract,
-    /// transaction and rule always produce the same ID, so receivers can
-    /// de-duplicate retries. Used as the PagerDuty `dedup_key`.
+    /// Used as the PagerDuty `dedup_key`.
     #[serde(default)]
     pub alert_id: String,
+    /// Human-readable label of the watched contract.
     pub label: String,
+    /// Contract ID the alert is about.
     pub contract_id: String,
+    /// Network the contract lives on (`"mainnet"`, `"testnet"`, …).
     pub network: String,
     /// Stable machine-readable rule variant (e.g. `"LargeTransfer"`).
     pub rule_type: String,
+    /// Human-readable description of the rule that fired.
     pub rule_triggered: String,
     /// Transaction hash, or `null` for synthetic alerts (e.g. `NoActivity`).
     pub transaction_hash: String,
@@ -487,6 +499,7 @@ pub struct AlertPayload {
     pub timestamp: i64,
     /// ISO 8601 timestamp string.
     pub timestamp_iso: String,
+    /// Horizon link to the transaction (or account for synthetic alerts).
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
@@ -558,7 +571,6 @@ pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str)
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
-/// Evaluate all rules for one contract against one transaction.
 /// Context passed to [`evaluate`] to identify the contract being evaluated
 /// and provide the link base URLs needed to build webhook payloads.
 ///
@@ -595,9 +607,13 @@ pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str)
 /// ```
 #[derive(Debug, Clone)]
 pub struct EvalContext<'a> {
+    /// Human-readable label of the watched contract.
     pub label: &'a str,
+    /// Contract ID being evaluated.
     pub contract_id: &'a str,
+    /// Network the contract lives on (`"mainnet"`, `"testnet"`, …).
     pub network: &'a str,
+    /// Horizon base URL used to build transaction links.
     pub horizon_base: &'a str,
     /// Explorer base URL for the network; `None` for custom networks that
     /// have no configured explorer (links will fall back to `horizon_link`).
@@ -1071,6 +1087,7 @@ pub fn check_no_activity(
     let ts = now.timestamp();
     let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
+    // Synthetic payloads have no transaction — use empty hash and link to Horizon
     // Synthetic payloads have no transaction — use empty hash and link to Horizon
     // account page rather than a specific transaction.
     let synthetic_hash = String::new();
