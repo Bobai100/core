@@ -1,6 +1,8 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/txwatch/txwatch/docs/txwatch-config.schema.json",
   "title": "AppConfig",
+  "description": "Schema for txwatch TOML configuration files.",
   "type": "object",
   "required": ["contracts"],
   "properties": {
@@ -11,10 +13,11 @@
     "http_connection_verbose": { "type": ["boolean", "null"] },
     "max_pages_per_cycle": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "description": "Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Default: 10." },
     "max_contracts": { "type": ["integer", "null"], "minimum": 1, "maximum": 10000, "description": "Maximum number of [[contracts]] entries. Default: 100." },
+    "contracts": { "type": "array", "items": { "$ref": "#/$defs/WatchedContract" }, "minItems": 1 }
     "concurrency": { "type": ["integer", "null"], "minimum": 1, "maximum": 256, "description": "Maximum number of contracts polled concurrently in one cycle (used by watch and watch --once). Default: 10." },
     "contracts": { "type": "array", "items": { "$ref": "#/definitions/WatchedContract" }, "minItems": 1 }
   },
-  "definitions": {
+  "$defs": {
     "WatchedContract": {
       "type": "object", "required": ["label", "contract_id", "network", "rules"], "additionalProperties": false,
       "anyOf": [
@@ -22,21 +25,28 @@
         { "required": ["webhooks"], "properties": { "webhooks": { "minItems": 1 } } }
       ],
       "properties": {
-        "label": { "type": "string", "maxLength": 128 }, "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+        "label": { "type": "string", "maxLength": 128 },
+        "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
         "network": { "oneOf": [
           { "enum": ["mainnet", "testnet", "futurenet"] },
           { "type": "object", "required": ["horizon_url"], "additionalProperties": false,
-            "properties": { "horizon_url": { "type": "string", "format": "uri" }, "explorer_url": { "type": ["string", "null"], "format": "uri" }, "passphrase": { "type": ["string", "null"] } } }
+            "properties": {
+              "horizon_url": { "type": "string", "format": "uri" },
+              "rpc_url": { "type": ["string", "null"], "format": "uri", "description": "Soroban RPC endpoint for this network." },
+              "explorer_url": { "type": ["string", "null"], "format": "uri" },
+              "passphrase": { "type": ["string", "null"] }
+            } }
         ] },
+        "soroban_rpc_url": { "type": ["string", "null"], "format": "uri", "description": "Soroban RPC endpoint used for contract event lookups." },
         "webhook_url": { "type": "string", "format": "uri", "description": "Shorthand for a single destination; described by the webhook_* fields." },
         "webhook_secret": { "type": ["string", "null"] },
-        "webhook_format": { "$ref": "#/definitions/WebhookFormat" },
-        "webhook_headers": { "$ref": "#/definitions/WebhookHeaders" },
+        "webhook_format": { "$ref": "#/$defs/WebhookFormat" },
+        "webhook_headers": { "$ref": "#/$defs/WebhookHeaders" },
         "webhook_routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when webhook_format = \"pagerduty\"." },
-        "webhooks": { "type": "array", "items": { "$ref": "#/definitions/WebhookDestination" } },
+        "webhooks": { "type": "array", "items": { "$ref": "#/$defs/WebhookDestination" } },
         "poll_interval_seconds": { "type": ["integer", "null"], "minimum": 5, "maximum": 3600 },
         "batch_alerts": { "type": "boolean", "default": false, "description": "Deliver each poll cycle's alerts as one {\"alerts\": [...]} POST (split into batches of at most 50)." },
-        "rules": { "type": "array", "items": { "$ref": "#/definitions/AlertRule" }, "minItems": 1 }
+        "rules": { "type": "array", "items": { "$ref": "#/$defs/AlertRule" }, "minItems": 1 }
       }
     },
     "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty"], "default": "txwatch" },
@@ -51,8 +61,8 @@
       "properties": {
         "url": { "type": "string", "format": "uri" },
         "secret": { "type": ["string", "null"] },
-        "format": { "$ref": "#/definitions/WebhookFormat" },
-        "headers": { "$ref": "#/definitions/WebhookHeaders" },
+        "format": { "$ref": "#/$defs/WebhookFormat" },
+        "headers": { "$ref": "#/$defs/WebhookHeaders" },
         "routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when format = \"pagerduty\"." }
       },
       "if": { "properties": { "format": { "const": "pagerduty" } }, "required": ["format"] },
@@ -66,6 +76,9 @@
         { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionCalled" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" } } },
         { "type": "object", "required": ["type", "function_names"], "properties": { "type": { "const": "AdminFunctionCalled" }, "function_names": { "type": "array", "items": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" } } } },
         { "type": "object", "required": ["type"], "properties": { "type": { "const": "HighFee" }, "threshold_stroops": { "type": "integer" }, "threshold_xlm": { "type": ["integer", "null"] } } },
+        { "type": "object", "required": ["type", "asset_code"], "properties": { "type": { "const": "AssetTransfer" }, "asset_code": { "type": "string", "pattern": "^[A-Z0-9]{1,12}$" }, "issuer": { "type": ["string", "null"] }, "min_amount": { "type": ["integer", "null"], "minimum": 0 } } },
+        { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionArgumentMatched" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" }, "argument_index": { "type": "integer", "minimum": 0 }, "argument_value": { "type": "string" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "ContractEvent" }, "topic": { "type": ["string", "null"] } } }
         { "type": "object", "required": ["type"], "properties": { "type": { "const": "ContractUpgraded" } } },
         {
           "type": "object", "required": ["type", "topic"],

@@ -487,8 +487,17 @@ async fn main() -> Result<()> {
             let raw = render_init_config(&contract_id, &network, &webhook_url)?;
             // Validate with the config crate before touching the filesystem.
             AppConfig::parse(&raw, output).context("the generated config is not valid")?;
-            fs::write(output, raw)
-                .with_context(|| format!("failed to write '{}'", output.display()))?;
+            // Write to a sibling temp file and rename over the target so an
+            // interrupted write never leaves a truncated config. `fs::rename`
+            // replaces an existing file atomically on Unix and on Windows
+            // (via MoveFileEx with MOVEFILE_REPLACE_EXISTING).
+            let tmp = output.with_extension("toml.tmp");
+            fs::write(&tmp, raw)
+                .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+            fs::rename(&tmp, output).with_context(|| {
+                let _ = fs::remove_file(&tmp);
+                format!("failed to write '{}'", output.display())
+            })?;
             println!(
                 "Wrote {}. Check it with: txwatch --config {} validate",
                 output.display(),
@@ -633,6 +642,7 @@ async fn main() -> Result<()> {
                 txwatch_poller::metrics::register_build_info();
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
+            // On Unix this installs a SIGHUP handler; on Windows it is a no-op.
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
             spawn_reload_on_sighup(config_path, cli.horizon_url.clone(), reload_tx)?;
 
@@ -797,15 +807,20 @@ fn spawn_reload_on_sighup(
     Ok(())
 }
 
+/// Windows has no SIGHUP, so config reloading is a no-op there. The poller
+/// still runs normally; restart the process to pick up a changed config.
 #[cfg(not(unix))]
 fn spawn_reload_on_sighup(
     _path: PathBuf,
     _horizon_url: Option<String>,
     _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
+    info!("SIGHUP config reload is not supported on this platform; restart to reload");
     Ok(())
 }
 
+/// Re-read and validate the config file. Only used by the Unix SIGHUP handler,
+/// so it is dead code on other platforms.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
