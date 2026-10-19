@@ -17,6 +17,7 @@ txwatch-config = { path = "../config", version = "0.1.0" }
 reqwest       = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+schemars      = { workspace = true }
 anyhow        = { workspace = true }
 tokio         = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 tracing       = { workspace = true }

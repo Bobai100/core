@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -80,7 +81,7 @@ pub struct HorizonTransaction {
 /// A Soroban contract event emitted by a transaction, as returned by Soroban
 /// RPC `getEvents` with `xdrFormat: "json"`. Topics and data are `ScVal`s in
 /// their JSON form, e.g. `{"symbol": "transfer"}` or `{"address": "G…"}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ContractEvent {
     /// Contract that emitted the event.
     pub contract_id: String,
@@ -535,7 +536,7 @@ impl EnrichedTransaction {
 // ── AlertPayload ──────────────────────────────────────────────────────────────
 
 /// The JSON body POSTed to the webhook URL when a rule fires.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct AlertPayload {
     /// Schema version for this payload shape (issue #58).
     /// Receivers should use this to detect breaking changes.
@@ -911,7 +912,20 @@ impl<T: RuleOverrides + ?Sized> RuleOverrides for &T {
 }
 
 impl RuleOverrides for AlertRule {}
-impl RuleOverrides for txwatch_config::RuleConfig {}
+impl RuleOverrides for txwatch_config::RuleConfig {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn webhook_url(&self) -> Option<&str> {
+        self.webhook_url.as_deref()
+    }
+    fn webhook_secret(&self) -> Option<&str> {
+        self.webhook_secret.as_deref()
+    }
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        self.severity.as_ref()
+    }
+}
 
 impl RuleOverrides for txwatch_config::RuleEntry {
     fn enabled(&self) -> bool {
