@@ -22,6 +22,7 @@ fuzzing = []
 txwatch-config = { path = "../config", version = "0.1.0" }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
+schemars       = { workspace = true }
 anyhow         = { workspace = true }
 chrono         = { workspace = true }
 tracing        = { workspace = true }

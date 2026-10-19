@@ -1,0 +1,192 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AlertPayload",
+  "description": "Webhook alert payload sent by TxWatch when a rule fires",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "alert_id",
+    "label",
+    "contract_id",
+    "network",
+    "rule_type",
+    "rule_triggered",
+    "transaction_hash",
+    "function_names",
+    "timestamp",
+    "timestamp_iso",
+    "horizon_link",
+    "explorer_link",
+    "resolved",
+    "matched_events",
+    "suppressed_count"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Schema version for this payload shape. Additive changes (new optional fields) keep the same version; breaking changes (field removals or renames) bump it."
+    },
+    "alert_id": {
+      "type": "string",
+      "description": "Stable, deterministic alert identifier derived from (network, contract_id, tx hash, rule_type, rule params) via SHA-256 (32 hex chars). Receivers should deduplicate on this value."
+    },
+    "label": {
+      "type": "string",
+      "description": "Human-readable contract label from the config."
+    },
+    "contract_id": {
+      "type": "string",
+      "description": "Soroban contract address (56-character string starting with 'C')."
+    },
+    "network": {
+      "type": "string",
+      "description": "Stellar network name (e.g. 'mainnet', 'testnet', 'futurenet')."
+    },
+    "rule_type": {
+      "type": "string",
+      "description": "Stable machine-readable rule variant (e.g. 'LargeTransfer', 'HighFee'). Use this for programmatic routing."
+    },
+    "rule_triggered": {
+      "type": "string",
+      "description": "Human-readable rule description with parameters (e.g. 'LargeTransfer(>=10000XLM)'). Use this for display."
+    },
+    "transaction_hash": {
+      "type": "string",
+      "description": "Stellar transaction hash."
+    },
+    "function_name": {
+      "type": ["string", "null"],
+      "description": "The first invoked Soroban function name, or null for non-Soroban transactions."
+    },
+    "function_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "All invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions)."
+    },
+    "amount_xlm": {
+      "type": ["integer", "null"],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Transfer amount in whole XLM (truncated integer). Kept for backward compatibility — use amount_xlm_decimal for precise accounting."
+    },
+    "amount_stroops": {
+      "type": ["integer", "null"],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Raw transfer amount in stroops (1 XLM = 10,000,000 stroops)."
+    },
+    "amount_xlm_decimal": {
+      "type": ["string", "null"],
+      "description": "Transfer amount as a decimal string with 7 fractional digits (e.g. '9999.9900000'). Use this instead of amount_xlm when precision matters."
+    },
+    "fee_charged_stroops": {
+      "type": ["integer", "null"],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Fee charged for the transaction in stroops."
+    },
+    "source_account": {
+      "type": "string",
+      "description": "The G-address that submitted the transaction. Omitted from the payload when not present on the Horizon record."
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["info", "warning", "critical"],
+      "description": "The severity level set on the matching rule. Omitted when not configured."
+    },
+    "timestamp": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Unix timestamp in seconds."
+    },
+    "timestamp_iso": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 / RFC 3339 timestamp string."
+    },
+    "horizon_link": {
+      "type": "string",
+      "format": "uri",
+      "description": "Direct Horizon REST API URL for the transaction. Useful for fetching raw XDR or operation details programmatically."
+    },
+    "explorer_link": {
+      "type": "string",
+      "format": "uri",
+      "description": "Stellar Expert web explorer URL for the transaction. Useful for human-readable inspection in a browser."
+    },
+    "ledger": {
+      "type": ["integer", "null"],
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Ledger sequence number in which this transaction was included."
+    },
+    "memo": {
+      "type": ["string", "null"],
+      "description": "Memo content (absent for MemoNone)."
+    },
+    "memo_type": {
+      "type": ["string", "null"],
+      "description": "Memo type: 'none', 'text', 'id', 'hash', or 'return'."
+    },
+    "operation_count": {
+      "type": ["integer", "null"],
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Total number of operations in the transaction."
+    },
+    "resolved": {
+      "type": "boolean",
+      "default": false,
+      "description": "true for a recovery alert (e.g. activity resumed after NoActivity). false (the default) for an incident alert."
+    },
+    "matched_events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ContractEvent"
+      },
+      "description": "For EventEmitted alerts, the matching contract events; empty for other rule types."
+    },
+    "suppressed_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0,
+      "description": "Number of matches of this rule suppressed by its cooldown_seconds since the previous alert was sent. 0 when the rule has no cooldown or nothing was suppressed."
+    },
+    "test": {
+      "type": "boolean",
+      "default": false,
+      "description": "true only for synthetic payloads sent by 'txwatch test-webhook'; omitted from the JSON otherwise."
+    },
+    "enrichment_incomplete": {
+      "type": "boolean",
+      "default": false,
+      "description": "true when the transaction's operations could not be fetched, so function_names / amount_stroops may be incomplete. Omitted from the JSON when false."
+    }
+  },
+  "definitions": {
+    "ContractEvent": {
+      "type": "object",
+      "description": "A Soroban contract event emitted by a transaction, as returned by Soroban RPC getEvents.",
+      "required": ["contract_id", "topics", "data"],
+      "properties": {
+        "contract_id": {
+          "type": "string",
+          "description": "Contract that emitted the event."
+        },
+        "topics": {
+          "type": "array",
+          "items": true,
+          "description": "ScVal topics in their JSON form (e.g. {\"symbol\": \"transfer\"})."
+        },
+        "data": {
+          "description": "ScVal data in JSON form."
+        }
+      }
+    }
+  }
+}

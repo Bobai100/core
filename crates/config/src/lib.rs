@@ -823,6 +823,18 @@ pub struct RuleConfig {
     /// the cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_seconds: Option<u64>,
+    /// Set `enabled = false` to silence a rule without removing it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override the webhook URL for this rule (falls back to the contract's URL).
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Override the webhook secret for this rule.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Optional severity level included in the alert payload.
+    #[serde(default)]
+    pub severity: Option<Severity>,
 }
 
 impl RuleConfig {
@@ -851,6 +863,10 @@ impl From<AlertRule> for RuleConfig {
         Self {
             rule,
             cooldown_seconds: None,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }
     }
 }
@@ -1092,6 +1108,22 @@ impl WebhookDestination {
                     field("headers"),
                     name
                 ));
+            }
+        }
+        // Case-insensitive duplicate detection
+        let mut seen_lower: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        for name in self.headers.0.keys() {
+            let lower = name.to_ascii_lowercase();
+            if let Some(first) = seen_lower.get(&lower) {
+                problems.push(format!(
+                    "{} contains duplicate header name {:?} (conflicts with {:?} case-insensitively)",
+                    field("headers"),
+                    name,
+                    first
+                ));
+            } else {
+                seen_lower.insert(lower, name.as_str());
             }
         }
         let has_routing_key = self

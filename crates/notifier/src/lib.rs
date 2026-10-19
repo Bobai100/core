@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
+use schemars::JsonSchema;
 use serde::Serialize;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -168,7 +169,7 @@ pub async fn send_to_destination_simple(
 pub const MAX_BATCH_SIZE: usize = 50;
 
 /// Body of a batched webhook POST: `{"alerts": [<AlertPayload>, ...]}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct AlertBatch<'a> {
     pub alerts: &'a [AlertPayload],
 }

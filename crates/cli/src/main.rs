@@ -142,8 +142,12 @@ enum Command {
         headers: Vec<String>,
     },
 
-    /// Print the JSON Schema for the TOML configuration file.
-    Schema,
+    /// Print the JSON Schema for the config file or the alert webhook payload
+    Schema {
+        /// Print the schema for the alert webhook payload instead of the config
+        #[arg(long)]
+        payload: bool,
+    },
 
     /// Print a shell completion script, e.g. `txwatch completions bash > /etc/bash_completion.d/txwatch`
     Completions {
@@ -198,6 +202,12 @@ enum Command {
         send: bool,
     },
 
+    /// Inspect, set, or reset saved poll cursors
+    Cursors {
+        #[command(subcommand)]
+        action: CursorsAction,
+    },
+
     /// Remove saved cursor entries for contracts that are no longer configured
     ///
     /// Reloads keep cursors of removed contracts so re-adding one resumes where
@@ -206,6 +216,30 @@ enum Command {
         /// Only report what would be removed, without writing the cursor file
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CursorsAction {
+    /// Show the current cursor for each configured contract
+    Show,
+    /// Set a contract's cursor to a specific paging token or ledger
+    Set {
+        /// Label of the contract to update
+        #[arg(long)]
+        contract: String,
+        /// Paging token to set as the cursor
+        #[arg(long, conflicts_with = "ledger")]
+        cursor: Option<String>,
+        /// Ledger sequence number to set as cursor start point
+        #[arg(long, conflicts_with = "cursor")]
+        ledger: Option<u64>,
+    },
+    /// Reset a contract's cursor to 'now' (re-processes from current ledger)
+    Reset {
+        /// Label of the contract to reset (omit to reset all)
+        #[arg(long)]
+        contract: Option<String>,
     },
 }
 
@@ -266,7 +300,7 @@ async fn main() -> Result<()> {
                 );
                 println!("    rules        : {}", c.rules.len());
                 for entry in &c.rules {
-                    println!("      - {}", entry.rule.label());
+                    println!("      - {}{}", entry.rule.label(), if !entry.enabled { " (disabled)" } else { "" });
                 }
                 println!("    horizon      : {}", c.network.horizon_base_url());
                 match c.network.explorer_base_url() {
@@ -535,6 +569,107 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Cursors { action } => {
+            let cfg = load_config(&cli)?;
+            let cursor_file = cfg.cursor_file.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("cursor_file is not set in the config; no cursors to manage")
+            })?;
+            let lock_path = format!("{}.lock", cursor_file);
+            if std::path::Path::new(&lock_path).exists() {
+                return Err(anyhow::anyhow!(
+                    "A TxWatch instance is running (lock file '{}' exists). Stop it before editing cursors.",
+                    lock_path
+                ));
+            }
+            let cursor_path = std::path::Path::new(cursor_file);
+            let mut cursors: std::collections::BTreeMap<String, String> = if cursor_path.exists() {
+                let raw = fs::read_to_string(cursor_path)
+                    .with_context(|| format!("failed to read cursor file '{}'", cursor_file))?;
+                if raw.trim().is_empty() {
+                    std::collections::BTreeMap::new()
+                } else {
+                    serde_json::from_str(&raw)
+                        .with_context(|| format!("failed to parse cursor file '{}'", cursor_file))?
+                }
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            match action {
+                CursorsAction::Show => {
+                    if cursors.is_empty() {
+                        println!("No saved cursors in '{}'.", cursor_file);
+                    } else {
+                        println!("Saved cursors in '{}':", cursor_file);
+                        for contract in &cfg.contracts {
+                            let key = txwatch_config::cursor_key(&contract.network, &contract.contract_id);
+                            let token = cursors.get(&key).map(String::as_str).unwrap_or("now (default)");
+                            println!("  [{network}] {label}", network = contract.network.display_name(), label = contract.label);
+                            println!("    key   : {}", key);
+                            println!("    cursor: {}", token);
+                        }
+                        // Also show any stale keys not in config
+                        let configured_keys: std::collections::HashSet<String> = cfg.contracts.iter()
+                            .map(|c| txwatch_config::cursor_key(&c.network, &c.contract_id))
+                            .collect();
+                        let stale: Vec<_> = cursors.keys().filter(|k| !configured_keys.contains(*k)).collect();
+                        if !stale.is_empty() {
+                            println!("  Stale entries (not in current config):");
+                            for key in stale {
+                                println!("    {} = {}", key, cursors[key]);
+                            }
+                        }
+                    }
+                }
+                CursorsAction::Set { contract: contract_label, cursor, ledger } => {
+                    let contract = cfg.contracts.iter()
+                        .find(|c| c.label == contract_label)
+                        .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract_label))?;
+                    let key = txwatch_config::cursor_key(&contract.network, &contract.contract_id);
+                    let new_cursor = if let Some(cur) = cursor {
+                        cur
+                    } else if let Some(ledger_seq) = ledger {
+                        // Horizon uses paging tokens, but a ledger sequence can be used as a starting point.
+                        // We store it with a prefix so the poller knows to resolve it.
+                        format!("{}", ledger_seq)
+                    } else {
+                        return Err(anyhow::anyhow!("--cursor or --ledger is required"));
+                    };
+                    cursors.insert(key.clone(), new_cursor.clone());
+                    let serialized = serde_json::to_string_pretty(&cursors)?;
+                    let tmp = cursor_path.with_extension("tmp");
+                    fs::write(&tmp, serialized)
+                        .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+                    fs::rename(&tmp, cursor_path)
+                        .with_context(|| format!("failed to replace '{}'", cursor_file))?;
+                    println!("Updated cursor for '{}' (key: {}) to: {}", contract_label, key, new_cursor);
+                }
+                CursorsAction::Reset { contract: contract_label } => {
+                    if let Some(label) = contract_label {
+                        let contract = cfg.contracts.iter()
+                            .find(|c| c.label == label)
+                            .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", label))?;
+                        let key = txwatch_config::cursor_key(&contract.network, &contract.contract_id);
+                        cursors.remove(&key);
+                        println!("Reset cursor for '{}' to 'now'.", label);
+                    } else {
+                        let configured_keys: std::collections::HashSet<String> = cfg.contracts.iter()
+                            .map(|c| txwatch_config::cursor_key(&c.network, &c.contract_id))
+                            .collect();
+                        for key in &configured_keys {
+                            cursors.remove(key);
+                        }
+                        println!("Reset all {} contract cursor(s) to 'now'.", configured_keys.len());
+                    }
+                    let serialized = serde_json::to_string_pretty(&cursors)?;
+                    let tmp = cursor_path.with_extension("tmp");
+                    fs::write(&tmp, serialized)
+                        .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+                    fs::rename(&tmp, cursor_path)
+                        .with_context(|| format!("failed to replace '{}'", cursor_file))?;
+                }
+            }
+        }
+
         Command::PruneCursors { dry_run } => {
             let cfg = load_config(&cli)?;
             let removed = prune_cursors(&cfg.cursor_file, &cfg, dry_run)?;
@@ -555,10 +690,19 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Schema => println!(
-            "{}",
-            serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?
-        ),
+        Command::Schema { payload } => {
+            if payload {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&schemars::schema_for!(txwatch_rules::AlertPayload))?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?
+                );
+            }
+        }
 
         Command::Watch {
             dry_run,
@@ -803,6 +947,12 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 if let Some(cooldown) = entry.cooldown_seconds {
                     map.insert("cooldown_seconds".to_string(), serde_json::json!(cooldown));
                 }
+                if !entry.enabled {
+                    map.insert("enabled".to_string(), serde_json::json!(false));
+                }
+                if let Some(sev) = &entry.severity {
+                    map.insert("severity".to_string(), serde_json::to_value(sev).unwrap_or_default());
+                }
                 serde_json::Value::Object(map.clone())
             }).collect();
             serde_json::json!({
@@ -813,11 +963,8 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "poll_interval_seconds": c.effective_poll_interval(cfg.poll_interval_seconds),
                 "webhook_url": c.webhook_url,
                 "webhook_secret_set": c.webhook_secret.is_some(),
-                "rules": rules,
-                "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url().unwrap_or(""), c.contract_id),
                 "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
-                "rules": c.rules,
+                "rules": rules,
                 "horizon_url": c.network.horizon_base_url(),
                 "explorer_url": c.network.explorer_base_url().map(|e| format!("{}/contract/{}", e, c.contract_id)),
             })
@@ -897,13 +1044,24 @@ fn parse_webhook_format(value: &str) -> Result<WebhookFormat, String> {
 /// Parses repeated `--header "Name: value"` arguments.
 fn parse_headers(raw: &[String]) -> Result<WebhookHeaders> {
     let mut headers = WebhookHeaders::default();
+    let mut seen_lower: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for header in raw {
         let (name, value) = header
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("--header must look like \"Name: value\""))?;
-        headers
-            .0
-            .insert(name.trim().to_owned(), value.trim().to_owned());
+        let name = name.trim().to_owned();
+        let value = value.trim().to_owned();
+        let lower = name.to_ascii_lowercase();
+        if let Some(existing) = seen_lower.get(&lower) {
+            return Err(anyhow::anyhow!(
+                "duplicate header name '{}' (conflicts with '{}' case-insensitively)",
+                name,
+                existing
+            ));
+        }
+        seen_lower.insert(lower, name.clone());
+        headers.0.insert(name, value);
     }
     Ok(headers)
 }

@@ -1,3 +1,33 @@
 /target
 Cargo.lock
 vrickish.md
+
+# Test snapshots and fixtures generated at test time
+**/*.snap
+**/*.snap.new
+**/snapshots/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Cursor lock files created by TxWatch at runtime
+*.cursor.lock
+cursors.json.lock
+
+# Build artifacts
+*.sql
+txwatch_testnet_snapshot_*.sql
