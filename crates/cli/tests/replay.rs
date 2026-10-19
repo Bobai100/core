@@ -10,6 +10,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TX_HASH: &str = "replay001";
+const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 fn write_config(name: &str, webhook_url: &str) -> PathBuf {
     let path = env::temp_dir().join(format!("txwatch_replay_{name}.toml"));
@@ -19,7 +20,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "Replay Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+contract_id = "{CONTRACT_ID}"
 network     = "testnet"
 webhook_url = "{webhook_url}"
 
@@ -55,10 +56,45 @@ async fn horizon_with_admin_call() -> MockServer {
             "_embedded": { "records": [{
                 "type":     "invoke_host_function",
                 "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
-                "parameters": [{
-                    "type": "Sym",
-                    "value": "AAAADwAAAAlzZXRfYWRtaW4="
-                }]
+                "parameters": [
+                    {
+                        "type": "Address",
+                        "value": "AAAAEgAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+                    },
+                    {
+                        "type": "Sym",
+                        "value": "AAAADwAAAAlzZXRfYWRtaW4="
+                    }
+                ]
+            }] }
+        })))
+        .mount(&horizon)
+        .await;
+    horizon
+}
+
+async fn horizon_with_unrelated_transaction() -> MockServer {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/transactions/{TX_HASH}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "hash":         TX_HASH,
+            "created_at":   "2024-06-01T10:00:00Z",
+            "successful":   true,
+            "paging_token": "900",
+            "fee_charged":  "100"
+        })))
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/transactions/{TX_HASH}/operations")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [{
+                "type": "payment",
+                "from": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                "to": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                "asset_type": "native",
+                "amount": "1.0000000"
             }] }
         })))
         .mount(&horizon)
@@ -92,6 +128,30 @@ async fn replay_with_contract(
         .output()
         .await
         .expect("failed to run txwatch")
+}
+
+async fn replay_with_rules(
+    horizon: &MockServer,
+    rules: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    let path = env::temp_dir().join("txwatch_replay_unrelated.toml");
+    let config = format!(
+        r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Replay Contract"
+contract_id = "{CONTRACT_ID}"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/unused"
+
+  [[contracts.rules]]
+  type = "{rules}"
+"#
+    );
+    fs::write(&path, config).unwrap();
+    replay(&path, horizon, extra).await
 }
 
 #[tokio::test]
@@ -191,4 +251,24 @@ async fn replay_unknown_transaction_exits_one() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("not found"));
+}
+
+#[tokio::test]
+async fn replay_rejects_unrelated_transaction_unless_forced() {
+    let horizon = horizon_with_unrelated_transaction().await;
+
+    let output = replay_with_rules(&horizon, "AnyTransaction", &[]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does not appear to involve contract"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+
+    let output = replay_with_rules(&horizon, "AnyTransaction", &["--force"]).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("1 rule(s) matched transaction replay001"));
 }

@@ -84,8 +84,15 @@ struct HorizonOperation {
     account: Option<String>,
     /// Present on `create_account` operations: the native starting balance.
     starting_balance: Option<String>,
-    /// Present on path payment operations: the account sending the payment.
+    /// Present on many operation types: the account that submitted the operation.
     source_account: Option<String>,
+    /// Present on operations involving accounts: participating account fields.
+    destination: Option<String>,
+    trustor: Option<String>,
+    claimant: Option<String>,
+    seller: Option<String>,
+    buyer: Option<String>,
+    /// Present on path payment operations: the account sending the payment.
     /// Present on path payment operations: the amount the source sends.
     source_amount: Option<String>,
     /// Asset of `amount` on path payments (`"native"` for XLM).
@@ -95,6 +102,9 @@ struct HorizonOperation {
     /// Present on `invoke_host_function` operations: Stellar Asset Contract
     /// balance changes caused by the call.
     asset_balance_changes: Option<Vec<AssetBalanceChange>>,
+    /// Present on Soroban operations when Horizon identifies the contract.
+    address: Option<String>,
+    contract_id: Option<String>,
 }
 
 /// One `{"type": ..., "value": ...}` entry of an operation's `parameters` array.
@@ -1603,8 +1613,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             // are fetched per transaction. Inline operations are still honoured
             // if a source ever provides them.
             let details = if !record.operations.is_empty() {
-                debug!(contract = %contract.label, tx = %tx_hash, "using inline operations");
-                extract_soroban_details(record.operations)
                 debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
                 extract_soroban_details(record.operations.clone(), &contract.contract_id).map(
                     |mut details| {
@@ -1635,7 +1643,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 .reduce(|a, b| a.saturating_add(b));
 
             let ledger = record.tx.ledger;
-            let mut enriched = match EnrichedTransaction::from_horizon(
             if ledger.is_some() {
                 state.last_ledger = ledger;
             }
@@ -1935,6 +1942,7 @@ pub async fn replay_transaction(
     client: &Client,
     contract: &WatchedContract,
     tx_hash: &str,
+    force: bool,
 ) -> Result<Vec<txwatch_rules::AlertPayload>> {
     let base = contract
         .horizon_base_url_override
@@ -1962,6 +1970,14 @@ pub async fn replay_transaction(
         .with_context(|| format!("failed to parse Horizon transaction from {}", url))?;
 
     let details = fetch_soroban_details(client, base, tx_hash, &contract.contract_id).await?;
+    if !details.involves_contract && !force {
+        anyhow::bail!(
+            "transaction {} does not appear to involve contract '{}' ({}); pass --force to replay anyway",
+            tx_hash,
+            contract.label,
+            contract.contract_id
+        );
+    }
     let amount_stroops = details
         .contract_transfers
         .iter()
@@ -2169,6 +2185,8 @@ fn parse_stroops(amount: &str) -> Result<u64> {
 /// Soroban details extracted from a transaction's operations.
 #[derive(Debug, Default, Clone)]
 struct SorobanDetails {
+    /// Whether any operation names or invokes the watched contract.
+    involves_contract: bool,
     /// Contract function names invoked by `invoke_host_function` operations.
     function_names: Vec<String>,
     /// Native XLM that moved into or out of the watched contract, attributed
@@ -2207,6 +2225,7 @@ fn extract_soroban_details(
     let mut details = SorobanDetails::default();
 
     for op in ops {
+        details.involves_contract |= operation_involves_contract(&op, contract_id);
         for transfer in native_transfers_moved(&op)? {
             let direction = match (transfer.from.as_deref(), transfer.to.as_deref()) {
                 (Some(from), _) if from == contract_id => "out",
@@ -2234,6 +2253,64 @@ fn extract_soroban_details(
     }
 
     Ok(details)
+}
+
+fn operation_involves_contract(op: &HorizonOperation, contract_id: &str) -> bool {
+    if op.address.as_deref() == Some(contract_id) || op.contract_id.as_deref() == Some(contract_id) {
+        return true;
+    }
+    if [
+        op.from.as_deref(),
+        op.to.as_deref(),
+        op.funder.as_deref(),
+        op.account.as_deref(),
+        op.source_account.as_deref(),
+        op.destination.as_deref(),
+        op.trustor.as_deref(),
+        op.claimant.as_deref(),
+        op.seller.as_deref(),
+        op.buyer.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|participant| participant == contract_id)
+    {
+        return true;
+    }
+    if op
+        .asset_balance_changes
+        .iter()
+        .flatten()
+        .any(|change| {
+            change.from.as_deref() == Some(contract_id)
+                || change.to.as_deref() == Some(contract_id)
+        })
+    {
+        return true;
+    }
+    if op.op_type != "invoke_host_function"
+        || !op
+            .host_function_type
+            .as_deref()
+            .is_some_and(|function| function.contains("InvokeContract"))
+    {
+        return false;
+    }
+
+    let Some(address) = op.parameters.iter().find(|p| p.scv_type == "Address") else {
+        return false;
+    };
+    let Some(raw) = base64_decode(&address.value) else {
+        return false;
+    };
+    let Ok(expected_hash) = txwatch_config::validate_contract_id(contract_id) else {
+        return false;
+    };
+    // ScVal Address XDR: SCV_ADDRESS, SC_ADDRESS_TYPE_CONTRACT, 32-byte hash.
+    raw.len() == 40
+        && u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) == 18
+        && u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]) == 1
+        && raw[8..] == expected_hash
 }
 
 /// Detect a change of the watched contract's executable from the transaction's
@@ -2509,6 +2586,8 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    const TEST_CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
     #[test]
     fn retry_after_seconds_are_used() {
         let now = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
@@ -2761,12 +2840,12 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let (fn_names, amount) = fetch_soroban_details(&client, &server.uri(), "abc123")
+        let details = fetch_soroban_details(&client, &server.uri(), "abc123", TEST_CONTRACT_ID)
             .await
             .unwrap();
 
-        assert_eq!(fn_names, vec!["push"], "the Sym parameter holds the name");
-        assert!(amount.is_none());
+        assert_eq!(details.function_names, vec!["push"], "the Sym parameter holds the name");
+        assert!(details.contract_transfers.is_empty());
     }
 
     /// The inline (`join=operations`) path must agree with the separate
@@ -2780,9 +2859,9 @@ mod tests {
         .expect("recorded fixture is valid JSON");
         let op: HorizonOperation =
             serde_json::from_value(recorded).expect("operation deserialises");
-        let (names, amount) = extract_soroban_details(vec![op]).unwrap();
-        assert_eq!(names, vec!["push"]);
-        assert!(amount.is_none());
+        let details = extract_soroban_details(vec![op], TEST_CONTRACT_ID).unwrap();
+        assert_eq!(details.function_names, vec!["push"]);
+        assert!(details.contract_transfers.is_empty());
     }
 
     /// An `invoke_host_function` with no `Sym` argument yields no name rather
@@ -2799,8 +2878,8 @@ mod tests {
             amount: None,
             ..Default::default()
         };
-        let (names, _) = extract_soroban_details(vec![op]).unwrap();
-        assert!(names.is_empty(), "no Sym means no contract function name");
+        let details = extract_soroban_details(vec![op], TEST_CONTRACT_ID).unwrap();
+        assert!(details.function_names.is_empty(), "no Sym means no contract function name");
     }
 
     #[tokio::test]
@@ -2808,7 +2887,8 @@ mod tests {
         let server = MockServer::start().await;
         let ops = serde_json::json!({
             "_embedded": { "records": [{
-                "type": "payment", "asset_type": "native", "amount": "1000.0000000"
+                "type": "payment", "asset_type": "native", "amount": "1000.0000000",
+                "from": "GOTHER", "to": TEST_CONTRACT_ID
             }] }
         });
         Mock::given(method("GET"))
@@ -2818,12 +2898,13 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let (fn_names, amount) = fetch_soroban_details(&client, &server.uri(), "abc123")
+        let details = fetch_soroban_details(&client, &server.uri(), "abc123", TEST_CONTRACT_ID)
             .await
             .unwrap();
 
-        assert!(fn_names.is_empty());
-        assert_eq!(amount, Some(10_000_000_000));
+        assert!(details.function_names.is_empty());
+        assert_eq!(details.contract_transfers.len(), 1);
+        assert_eq!(details.contract_transfers[0].stroops, 10_000_000_000);
     }
 
     fn payment_op(asset_type: &str, amount: &str) -> HorizonOperation {
@@ -2870,7 +2951,7 @@ mod tests {
 
     #[test]
     fn extract_soroban_details_errors_on_malformed_native_amount() {
-        assert!(extract_soroban_details(vec![payment_op("native", "1.2.3")]).is_err());
+        assert!(extract_soroban_details(vec![payment_op("native", "1.2.3")], TEST_CONTRACT_ID).is_err());
     }
 
     #[test]
@@ -2879,12 +2960,15 @@ mod tests {
             payment_op("credit_alphanum4", "50000.0000000"),
             payment_op("native", "1.5"),
         ];
-        let (_, amount) = extract_soroban_details(ops).unwrap();
-        assert_eq!(amount, Some(15_000_000));
+        let details = extract_soroban_details(ops, TEST_CONTRACT_ID).unwrap();
+        assert!(details.contract_transfers.is_empty());
 
-        let (_, amount) =
-            extract_soroban_details(vec![payment_op("credit_alphanum4", "50000.0000000")]).unwrap();
-        assert!(amount.is_none());
+        let details = extract_soroban_details(
+            vec![payment_op("credit_alphanum4", "50000.0000000")],
+            TEST_CONTRACT_ID,
+        )
+        .unwrap();
+        assert!(details.contract_transfers.is_empty());
     }
 
     /// A large non-native payment must not populate the amount, so
@@ -2907,10 +2991,10 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let (_, amount) = fetch_soroban_details(&client, &server.uri(), "abc123")
+        let details = fetch_soroban_details(&client, &server.uri(), "abc123", TEST_CONTRACT_ID)
             .await
             .unwrap();
-        assert!(amount.is_none());
+        assert!(details.contract_transfers.is_empty());
     }
 
     /// A 15-operation transaction whose matching function is the 12th op must
@@ -2941,10 +3025,10 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let (fn_names, _) = fetch_soroban_details(&client, &server.uri(), "abc123")
+        let details = fetch_soroban_details(&client, &server.uri(), "abc123", TEST_CONTRACT_ID)
             .await
             .unwrap();
-        assert_eq!(fn_names, vec!["withdraw"]);
+        assert_eq!(details.function_names, vec!["withdraw"]);
 
         let reqs = server.received_requests().await.unwrap();
         assert!(reqs[0].url.query().unwrap_or("").contains("limit=200"));
@@ -2982,10 +3066,10 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let (fn_names, _) = fetch_soroban_details(&client, &server.uri(), "abc123")
+        let details = fetch_soroban_details(&client, &server.uri(), "abc123", TEST_CONTRACT_ID)
             .await
             .unwrap();
-        assert_eq!(fn_names, vec!["withdraw"]);
+        assert_eq!(details.function_names, vec!["withdraw"]);
     }
 
     #[tokio::test]
@@ -2999,12 +3083,12 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let (fn_names, amount) = fetch_soroban_details(&client, &server.uri(), "abc123")
+        let details = fetch_soroban_details(&client, &server.uri(), "abc123", TEST_CONTRACT_ID)
             .await
             .unwrap();
 
-        assert!(fn_names.is_empty());
-        assert!(amount.is_none());
+        assert!(details.function_names.is_empty());
+        assert!(details.contract_transfers.is_empty());
     }
 
     #[tokio::test]
@@ -3016,7 +3100,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = fetch_soroban_details(&Client::new(), &server.uri(), "abc123")
+        let error = fetch_soroban_details(
+            &Client::new(),
+            &server.uri(),
+            "abc123",
+            TEST_CONTRACT_ID,
+        )
             .await
             .unwrap_err()
             .to_string();

@@ -254,6 +254,10 @@ enum Command {
         /// Also deliver the resulting webhooks to the contract's webhook_url
         #[arg(long)]
         send: bool,
+
+        /// Replay even when the transaction does not appear to involve the contract
+        #[arg(long)]
+        force: bool,
     },
 
     /// Inspect, set, or reset saved poll cursors
@@ -764,12 +768,14 @@ async fn main() -> Result<()> {
             ref contract,
             ref tx,
             send,
+            force,
         } => {
             let cfg = load_config(&cli)?;
             let contract = find_contract_by_label(&cfg, contract)?;
             let client = build_client().context("failed to build HTTP client")?;
 
-            let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
+            let payloads =
+                txwatch_poller::replay_transaction(&client, &contract, tx, force).await?;
             println!(
                 "{} rule(s) matched transaction {} for '{}'",
                 payloads.len(),
