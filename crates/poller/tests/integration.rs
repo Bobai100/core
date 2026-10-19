@@ -74,6 +74,7 @@ async fn run_polls_once_and_fires_webhook() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -146,6 +147,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -192,6 +194,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -861,6 +864,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -927,6 +931,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -1005,6 +1010,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -1104,6 +1110,7 @@ async fn contracts_polled_concurrently() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
         cursor_file: None,
     };
 
@@ -1224,6 +1231,7 @@ async fn slow_contract_does_not_block_fast_contract() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
         cursor_file: None,
     };
 
@@ -1302,6 +1310,7 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1393,6 +1402,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
@@ -1450,6 +1460,7 @@ async fn horizon_rejects_a_contract_address_on_the_accounts_endpoint() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let report = txwatch_poller::run_once(cfg, true)
@@ -1524,6 +1535,7 @@ async fn cursor_file_is_persisted_after_a_poll_cycle() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1839,6 +1851,7 @@ async fn transactions_request_includes_failed() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
     };
 
     // Dry run: this asserts the request we send, not the delivery path.

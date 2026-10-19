@@ -24,8 +24,9 @@
 //!
 //! - `GET /metrics` — Prometheus text exposition format
 //! - `GET /healthz` — `200` while the process is running
-//! - `GET /readyz`  — `200` once a poll has succeeded within the last
-//!   2 × `poll_interval_seconds`, `503` otherwise
+//! - `GET /readyz`  — `200` when enough contracts (see `readiness_policy`)
+//!   have polled successfully within 2 × their own effective
+//!   `poll_interval_seconds`, `503` otherwise
 //!
 //! Any other path returns `404`, and any other method `405`.
 
@@ -35,11 +36,9 @@ use prometheus::{
     IntCounterVec, IntGaugeVec,
 };
 use std::{
+    collections::HashMap,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -51,6 +50,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use tokio::{net::TcpListener, sync::watch};
+use txwatch_config::ReadinessPolicy;
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
@@ -272,9 +272,7 @@ pub fn inc_transactions_degraded(contract: &str, network: &str, n: u64) {
 
 /// Increment `txwatch_alerts_total` for a contract by `n`.
 pub fn inc_alerts(contract: &str, network: &str, n: u64) {
-    alerts_total()
-        .with_label_values(&[contract, network])
-        .inc();
+    alerts_total().with_label_values(&[contract, network]).inc();
 }
 
 /// Increment `txwatch_alerts_suppressed_total` for a contract's rule type by 1.
@@ -348,6 +346,9 @@ pub fn remove_contract(contract: &str, network: &str) {
     ] {
         let _ = gauge.remove_label_values(&[contract, network]);
     }
+    lock_readiness()
+        .contracts
+        .remove(&(contract.to_owned(), network.to_owned()));
 }
 
 /// Record a successful poll of a contract: freshness timestamp and reset
@@ -368,6 +369,232 @@ pub fn record_poll_failure(contract: &str, network: &str) {
         .inc();
 }
 
-// ── Readiness ─────────────────────────
+// ── Readiness ─────────────────────────────────────────────────────────────────
 
-/* … truncated 4651 chars — edit only what you need near the top … */
+/// Readiness of one polled contract.
+#[derive(Debug, Clone, Copy)]
+struct ContractReadiness {
+    /// The contract's effective poll interval in seconds.
+    interval_secs: u64,
+    /// Unix seconds of its last successful poll (0 = never).
+    last_success: u64,
+}
+
+#[derive(Default)]
+struct Readiness {
+    policy: ReadinessPolicy,
+    /// Keyed by `(contract label, network)`, like the per-contract gauges.
+    contracts: HashMap<(String, String), ContractReadiness>,
+}
+
+fn lock_readiness() -> std::sync::MutexGuard<'static, Readiness> {
+    static R: OnceLock<Mutex<Readiness>> = OnceLock::new();
+    R.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Set the policy `/readyz` applies (called at start-up and on reload).
+pub fn set_readiness_policy(policy: ReadinessPolicy) {
+    lock_readiness().policy = policy;
+}
+
+/// Start tracking a polled contract's readiness against its effective poll
+/// interval. Re-registering keeps its last success and updates the interval.
+pub fn register_contract(contract: &str, network: &str, interval_secs: u64) {
+    lock_readiness()
+        .contracts
+        .entry((contract.to_owned(), network.to_owned()))
+        .and_modify(|c| c.interval_secs = interval_secs)
+        .or_insert(ContractReadiness {
+            interval_secs,
+            last_success: 0,
+        });
+}
+
+/// Record that a contract poll just succeeded (for readiness).
+pub fn mark_poll_success(contract: &str, network: &str, interval_secs: u64) {
+    lock_readiness().contracts.insert(
+        (contract.to_owned(), network.to_owned()),
+        ContractReadiness {
+            interval_secs,
+            last_success: now_secs(),
+        },
+    );
+}
+
+/// A contract is healthy when it polled successfully within 2 × its interval.
+fn is_healthy(c: &ContractReadiness, now: u64) -> bool {
+    c.last_success != 0
+        && c.interval_secs != 0
+        && now.saturating_sub(c.last_success) <= c.interval_secs.saturating_mul(2)
+}
+
+fn evaluate<'a>(
+    policy: ReadinessPolicy,
+    contracts: impl IntoIterator<Item = &'a ContractReadiness>,
+    now: u64,
+) -> bool {
+    let (mut healthy, mut total) = (0, 0);
+    for c in contracts {
+        total += 1;
+        healthy += usize::from(is_healthy(c, now));
+    }
+    policy.is_satisfied(healthy, total)
+}
+
+/// Ready when the tracked contracts satisfy the readiness policy.
+fn is_ready() -> bool {
+    let r = lock_readiness();
+    evaluate(r.policy, r.contracts.values(), now_secs())
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
+
+/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
+///
+/// Binds the listener, starts serving on a background task and returns the
+/// address that was actually bound. Callers may pass port `0`, so the returned
+/// address is the one to scrape. Returns an error only if the listener cannot
+/// be bound.
+pub async fn serve_metrics(
+    addr: SocketAddr,
+    shutdown: watch::Receiver<bool>,
+) -> Result<SocketAddr> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind metrics listener on {addr}"))?;
+    // The caller may pass port 0, so hand back what we actually bound.
+    let bound = listener
+        .local_addr()
+        .with_context(|| format!("read local address of metrics listener on {addr}"))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = accept_loop(listener, shutdown).await {
+            tracing::error!(error = %e, "metrics endpoint stopped");
+        }
+    });
+
+    Ok(bound)
+}
+
+async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "metrics accept failed");
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(handle_request);
+                    if let Err(err) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        tracing::debug!(error = %err, "metrics connection error");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_request(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    let response = match (req.method().as_str(), req.uri().path()) {
+        ("GET", "/metrics") => text_response(
+            StatusCode::OK,
+            prometheus::TextEncoder::new()
+                .encode_to_string(&prometheus::gather())
+                .unwrap_or_default(),
+        ),
+        ("GET", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
+        ("GET", "/readyz") => {
+            if is_ready() {
+                text_response(StatusCode::OK, "ready\n".to_string())
+            } else {
+                text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n".to_string())
+            }
+        }
+        ("GET", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
+        _ => text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed\n".to_string(),
+        ),
+    };
+    Ok(response)
+}
+
+fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contract(interval_secs: u64, last_success: u64) -> ContractReadiness {
+        ContractReadiness {
+            interval_secs,
+            last_success,
+        }
+    }
+
+    #[test]
+    fn mixed_intervals_use_each_contracts_own_interval() {
+        let now = 10_000;
+        // Polled 300 s ago: stale at 10 s, fresh at 600 s.
+        let long = contract(600, now - 300);
+        let short = contract(10, now - 5);
+        assert!(evaluate(ReadinessPolicy::All, [&long, &short], now));
+        assert!(!evaluate(
+            ReadinessPolicy::All,
+            [&contract(10, now - 300), &short],
+            now
+        ));
+    }
+
+    #[test]
+    fn partial_failure_follows_policy() {
+        let now = 10_000;
+        let ok = contract(10, now - 5);
+        let failing = contract(10, now - 100);
+        let never = contract(10, 0);
+        let set = [&ok, &failing, &never, &ok];
+        assert!(!evaluate(ReadinessPolicy::All, set, now));
+        assert!(evaluate(ReadinessPolicy::Any, set, now));
+        assert!(evaluate(ReadinessPolicy::Percent(50), set, now));
+        assert!(!evaluate(ReadinessPolicy::Percent(51), set, now));
+        assert!(!evaluate(ReadinessPolicy::Any, [&failing, &never], now));
+    }
+
+    #[test]
+    fn no_contracts_is_not_ready() {
+        assert!(!evaluate(ReadinessPolicy::Any, [], 10_000));
+    }
+}

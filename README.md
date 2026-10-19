@@ -278,7 +278,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
 - `X-TxWatch-Alert-Id: <alert_id>` (same value as the `alert_id` body field — usable for deduplication without parsing the body)
-- `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
+- `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body; see [Verifying webhook signatures](docs/verifying-webhooks.md))
 - `X-TxWatch-Secret: <webhook_secret>` (optional, only when `webhook_secret` is configured — the raw secret; verify the signature instead where possible)
 - Any custom headers from `webhook_headers` (e.g. `Authorization: Bearer ${TOKEN}`)
 
