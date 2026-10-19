@@ -8,6 +8,9 @@
 #
 #   docker compose -f docker-compose.local.yml kill -s HUP txwatch
 #
+# The txwatch service is built with the `metrics` feature (mirroring the
+# published metrics-enabled image), so health probes are available at
+# http://localhost:9090/healthz and http://localhost:9090/readyz.
 # Images are pinned by tag and digest. To bump, update both the tag and the
 # digest here (and in docker-compose.yml); Dependabot's docker ecosystem is
 # configured to watch this directory.
@@ -29,7 +32,10 @@ services:
       - txwatch
 
   txwatch:
-    build: .
+    build:
+      context: .
+      args:
+        FEATURES: metrics
     container_name: txwatch-local
     volumes:
       - ./config/local.toml:/config/txwatch.toml:ro
@@ -37,7 +43,15 @@ services:
     environment:
       RUST_LOG: info
       TXWATCH_CONFIG: /config/txwatch.toml
-    command: watch
+    command: ["watch", "--metrics-addr", "0.0.0.0:9090"]
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     depends_on:
       stellar:
         condition: service_healthy

@@ -639,7 +639,10 @@ async fn main() -> Result<()> {
             #[cfg(feature = "metrics")]
             if let Some(addr) = metrics_addr {
                 // Register before serving so the first scrape already has it.
-                txwatch_poller::metrics::register_build_info();
+                txwatch_poller::metrics::register_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    env!("TXWATCH_GIT_SHA"),
+                );
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
             // On Unix this installs a SIGHUP handler; on Windows it is a no-op.

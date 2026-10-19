@@ -136,6 +136,18 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}}-metrics
+            type=semver,pattern={{major}}.{{minor}}-metrics
+
+      - name: Compute build args
+        id: buildargs
+        shell: bash
+        run: |
+          # Short SHA for --version output; build.rs prefers TXWATCH_GIT_SHA.
+          echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          # Reproducible timestamp: metadata-action emits RFC3339 `created`.
+          epoch=$(date -u -d "${{ steps.meta.outputs.created }}" +%s)
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v7
         with:
@@ -144,3 +156,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            TXWATCH_GIT_SHA=${{ steps.buildargs.outputs.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.buildargs.outputs.epoch }}
+            FEATURES=metrics

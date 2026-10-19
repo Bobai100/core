@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=TXWATCH_GIT_SHA");
 
     // Rebuild when the checked-out commit changes. The paths must point at the
     // repository's real git dir: relative `.git/...` paths resolve against
@@ -58,8 +59,16 @@ fn rerun_paths(git_dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// `TXWATCH_GIT_SHA` wins when set (Docker builds exclude `.git/`), otherwise
+/// the checked-out commit is used, and only a build outside git reports
+/// "unknown".
 fn git_sha() -> String {
-    git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
+    std::env::var("TXWATCH_GIT_SHA")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .or_else(|| git(&["rev-parse", "--short", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Build time as an RFC 3339 UTC string. Reproducible: `SOURCE_DATE_EPOCH`
