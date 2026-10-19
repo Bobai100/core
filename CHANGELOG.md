@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WatchedContract::collect_errors` and `AppConfig::validate` now collect all validation errors before returning instead of stopping at the first failure (#60).
 - Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
 
+### Removed
+
+- `PlanCache` (and its `txwatch-poller` re-export) removed as dead code: it cached results for a `GET /api/analytics/plan-statistics` endpoint that TxWatch does not have (#292).
+
 
 - `X-TxWatch-Version` header on every webhook request
 - `${ENV_VAR}` interpolation for `webhook_secret`
@@ -52,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `poll_interval_seconds` is bounded to 5–3600 seconds
 - `txwatch test-webhook` exits with code 1 when delivery fails
 - Config parse errors name the offending field path
-- Config validation reports every error at once instead of stopping at the first
+- Config validation reports every error at once instead of stopping at the first error
 - `--config` defaults to `./txwatch.toml` instead of `config/example.toml`, and a missing config file is an error
 - `poll_interval_seconds` defaults to 10 and is no longer required
 - `http_pool_max_idle_per_host` and `http_tcp_keepalive_secs` have concrete defaults (10 and 30) and are range-checked (1–100 and 0–7200); `http_tcp_keepalive_secs = 0` now disables keepalive as documented

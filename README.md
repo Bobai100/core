@@ -476,3 +476,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 - #285: Contract Events Cost One `getEvents` Call per Ledger
 <!-- handsoff-issue-287 -->
 - #287: A Debug Log Message Contains a Long Run of Embedded Spaces
+<!-- handsoff-issue-290 -->
+- #290: `SorobanEventStreamer` "Stream" Mode Calls a Non-Existent Endpoint and Hangs
