@@ -1,7 +1,10 @@
 //! Attack tests for `txwatch-config` verifying defenses against malicious configurations,
 //! integer overflow attempts, injection attacks, and invalid contract parameters.
 
-use txwatch_config::{AlertRule, RuleConfig, WatchedContract};
+use txwatch_config::{
+    AlertRule, ArgMatcher, RuleConfig, RuleEntry, WatchedContract, MAX_ARG_VALUE_LEN,
+    MAX_FUNCTION_ARGS,
+};
 
 #[test]
 fn test_attack_oversized_transfer_threshold_rejected() {
@@ -33,6 +36,7 @@ fn test_attack_symbol_injection_rejected() {
     let mut rule = AlertRule::FunctionCalled {
         function_name: "drop table users;--".into(),
         match_mode: Default::default(),
+        args: vec![],
     };
     let result = rule.validate("attack-target");
     assert!(
@@ -43,6 +47,7 @@ fn test_attack_symbol_injection_rejected() {
     let mut rule_long = AlertRule::FunctionCalled {
         function_name: "a".repeat(33), // Max 32 chars
         match_mode: Default::default(),
+        args: vec![],
     };
     let result_long = rule_long.validate("attack-target");
     assert!(
@@ -106,5 +111,141 @@ fn test_attack_control_character_injection_rejected() {
     assert!(
         result.is_err(),
         "Validator must reject control character injection in label"
+    );
+}
+
+fn function_called_with_args(args: Vec<ArgMatcher>) -> AlertRule {
+    AlertRule::FunctionCalled {
+        function_name: "transfer".into(),
+        match_mode: Default::default(),
+        args,
+    }
+}
+
+fn arg(index: u32, eq: &str) -> ArgMatcher {
+    ArgMatcher {
+        index,
+        eq: eq.into(),
+    }
+}
+
+#[test]
+fn test_attack_function_args_duplicate_or_excess_rejected() {
+    let mut rule_dup = function_called_with_args(vec![arg(1, "GABC"), arg(1, "GDEF")]);
+    assert!(
+        rule_dup.validate("attack-target").is_err(),
+        "Validator must reject duplicate argument indices"
+    );
+
+    let too_many = (0..=MAX_FUNCTION_ARGS as u32).map(|i| arg(i, "x")).collect();
+    let mut rule_many = function_called_with_args(too_many);
+    assert!(
+        rule_many.validate("attack-target").is_err(),
+        "Validator must reject more than MAX_FUNCTION_ARGS matchers"
+    );
+}
+
+#[test]
+fn test_attack_function_args_empty_or_oversized_value_rejected() {
+    let mut rule_empty = function_called_with_args(vec![arg(0, "   ")]);
+    assert!(
+        rule_empty.validate("attack-target").is_err(),
+        "Validator must reject an empty expected value"
+    );
+
+    let mut rule_long =
+        function_called_with_args(vec![arg(0, &"a".repeat(MAX_ARG_VALUE_LEN + 1))]);
+    assert!(
+        rule_long.validate("attack-target").is_err(),
+        "Validator must reject an oversized expected value"
+    );
+
+    let mut rule_ok = function_called_with_args(vec![arg(0, " GABC ")]);
+    rule_ok.validate("attack-target").unwrap();
+    let AlertRule::FunctionCalled { args, .. } = &rule_ok else {
+        unreachable!()
+    };
+    assert_eq!(args[0].eq, "GABC", "expected values are trimmed");
+}
+
+fn any_transaction_entry() -> Box<RuleEntry> {
+    Box::new(RuleEntry {
+        enabled: true,
+        webhook_url: None,
+        webhook_secret: None,
+        severity: None,
+        rule: AlertRule::AnyTransaction,
+    })
+}
+
+#[test]
+fn test_attack_rate_rule_invalid_parameters_rejected() {
+    let mut rule_zero_count = AlertRule::Rate {
+        rule: any_transaction_entry(),
+        count: 0,
+        window_seconds: 300,
+    };
+    let result_zero_count = rule_zero_count.validate("attack-target");
+    assert!(
+        result_zero_count.is_err(),
+        "Validator must reject a Rate rule with zero count"
+    );
+
+    let mut rule_zero_window = AlertRule::Rate {
+        rule: any_transaction_entry(),
+        count: 10,
+        window_seconds: 0,
+    };
+    let result_zero_window = rule_zero_window.validate("attack-target");
+    assert!(
+        result_zero_window.is_err(),
+        "Validator must reject a Rate rule with zero window"
+    );
+
+    let mut rule_huge_window = AlertRule::Rate {
+        rule: any_transaction_entry(),
+        count: 10,
+        window_seconds: u64::MAX,
+    };
+    let result_huge_window = rule_huge_window.validate("attack-target");
+    assert!(
+        result_huge_window.is_err(),
+        "Validator must reject a Rate rule with an out-of-range window"
+    );
+}
+
+#[test]
+fn test_attack_memo_rule_invalid_parameters_rejected() {
+    let mut rule_both = AlertRule::Memo {
+        memo_type: None,
+        equals: Some("12345".into()),
+        prefix: Some("12".into()),
+    };
+    let result_both = rule_both.validate("attack-target");
+    assert!(
+        result_both.is_err(),
+        "Validator must reject a Memo rule with both equals and prefix"
+    );
+
+    let mut rule_neither = AlertRule::Memo {
+        memo_type: None,
+        equals: None,
+        prefix: None,
+    };
+    let result_neither = rule_neither.validate("attack-target");
+    assert!(
+        result_neither.is_err(),
+        "Validator must reject a Memo rule with neither equals nor prefix"
+    );
+
+    let mut rule_bad_type = AlertRule::Memo {
+        memo_type: Some("bogus".into()),
+        equals: Some("12345".into()),
+        prefix: None,
+    };
+    let result_bad_type = rule_bad_type.validate("attack-target");
+    assert!(
+        result_bad_type.is_err(),
+        "Validator must reject an unknown memo_type"
     );
 }

@@ -89,3 +89,73 @@ async fn skipped_transactions_are_counted_in_metrics() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn operations_fetch_failure_is_not_silently_under_alerted() {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_embedded": { "records": [
+                record("degradedtx", "1", "2024-06-01T10:00:00Z"),
+            ] }
+        })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_embedded": { "records": [] }
+        })))
+        .mount(&horizon)
+        .await;
+    // Every operations fetch fails: the transaction cannot be enriched.
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&horizon)
+        .await;
+
+    let mut cfg = AppConfig::parse(
+        r#"
+        [[contracts]]
+        label = "Degraded Test Contract"
+        contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        network = "testnet"
+        webhook_url = "https://hooks.example.com/x"
+        [[contracts.rules]]
+        type = "AnyTransaction"
+        "#,
+        Path::new("test.toml"),
+    )
+    .unwrap();
+    cfg.contracts[0].horizon_base_url_override = Some(horizon.uri());
+
+    let (_server_tx, server_rx) = watch::channel(false);
+    let addr = txwatch_poller::serve_metrics("127.0.0.1:0".parse().unwrap(), server_rx)
+        .await
+        .expect("start metrics endpoint");
+
+    // Signal shutdown up front: the poller runs one full cycle, then returns.
+    let (poller_tx, poller_rx) = watch::channel(false);
+    poller_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        txwatch_poller::run_with_shutdown(cfg, true, poller_rx),
+    )
+    .await
+    .expect("poll cycle should finish");
+
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .expect("scrape /metrics")
+        .text()
+        .await
+        .unwrap();
+    let labels = r#"{contract="Degraded Test Contract",network="testnet"}"#;
+    assert!(
+        body.contains(&format!("txwatch_transactions_degraded_total{labels} 1")),
+        "operations fetch failure must be counted as degraded: {body}"
+    );
+}

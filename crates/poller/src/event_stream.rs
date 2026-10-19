@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Delivery mode for a contract's event feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -162,7 +162,11 @@ pub fn parse_sse_frame(frame: &str) -> Option<SseEvent> {
 /// Supports multiple Horizon/RPC endpoints per network or contract. On a
 /// connection error or 5xx response, the streamer falls back to the next
 /// configured endpoint for that poll cycle.
-pub struct SorobanEventStreamer {
+///
+/// This is the single RPC `getEvents` client used by the poller; it shares
+/// [`GetEventsParams`], [`GetEventsResult`], and [`SorobanEvent`] with the
+/// poller's `fetch_ledger_events` path so fixes reach both call sites.
+pub(crate) struct SorobanEventStreamer {
     rpc_urls: Vec<String>,
     active_url: usize,
     contract_ids: Vec<String>,
@@ -170,12 +174,13 @@ pub struct SorobanEventStreamer {
     current_ledger: u64,
     client: Client,
     mode: StreamMode,
+    #[allow(dead_code)]
     consecutive_disconnects: u32,
 }
 
 impl SorobanEventStreamer {
     /// Creates a streamer from a single endpoint (backwards compatible).
-    pub fn new(rpc_url: impl Into<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
+    pub(crate) fn new(rpc_url: impl Into<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
         Self::with_urls(vec![rpc_url.into()], contract_ids, start_ledger)
     }
 
@@ -183,7 +188,7 @@ impl SorobanEventStreamer {
     ///
     /// The first URL is used until it fails; subsequent polls then start from
     /// the endpoint that last succeeded.
-    pub fn with_urls(rpc_urls: Vec<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
+    pub(crate) fn with_urls(rpc_urls: Vec<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
         Self {
             rpc_urls,
             active_url: 0,
@@ -197,18 +202,18 @@ impl SorobanEventStreamer {
     }
 
     /// Sets the delivery mode for this contract's feed.
-    pub fn with_mode(mut self, mode: StreamMode) -> Self {
+    pub(crate) fn with_mode(mut self, mode: StreamMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Returns the currently active delivery mode, accounting for fallback.
-    pub fn mode(&self) -> StreamMode {
+    pub(crate) fn mode(&self) -> StreamMode {
         self.mode
     }
 
     /// The last paging token seen, used to resume a stream on reconnect.
-    pub fn last_cursor(&self) -> Option<&str> {
+    pub(crate) fn last_cursor(&self) -> Option<&str> {
         self.last_cursor.as_deref()
     }
 
@@ -222,7 +227,7 @@ impl SorobanEventStreamer {
     /// rejects requests that combine the two. After a page is returned, the
     /// ledger position advances only past the last event actually delivered so
     /// unread events between the page and the tip are not skipped.
-    pub async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
+    pub(crate) async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
         if self.rpc_urls.is_empty() {
             return Err(anyhow!("no Horizon/RPC endpoints configured"));
         }
@@ -266,7 +271,7 @@ impl SorobanEventStreamer {
                         debug!(url = %url, "switched active RPC endpoint");
                         self.active_url = idx;
                     }
-
+                    self.consecutive_disconnects = 0;
                     if let Some(cursor) = result.cursor.clone() {
                         self.last_cursor = Some(cursor);
                     }
@@ -297,7 +302,11 @@ impl SorobanEventStreamer {
         Err(last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed")))
     }
 
-    async fn try_fetch(&self, url: &str, request_body: &JsonRpcRequest<GetEventsParams>) -> Result<GetEventsResult> {
+    async fn try_fetch(
+        &self,
+        url: &str,
+        request_body: &JsonRpcRequest<GetEventsParams>,
+    ) -> Result<GetEventsResult> {
         let response = self
             .client
             .post(url)
@@ -331,7 +340,10 @@ fn build_client() -> Client {
     Client::builder()
         .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .unwrap_or_else(|err| {
+            info!(error = %err, "falling back to default HTTP client");
+            Client::new()
+        })
 }
 
 #[cfg(test)]
@@ -353,7 +365,11 @@ mod tests {
         })
     }
 
-    fn rpc_result(events: Vec<serde_json::Value>, latest_ledger: u64, cursor: Option<&str>) -> serde_json::Value {
+    fn rpc_result(
+        events: Vec<serde_json::Value>,
+        latest_ledger: u64,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,

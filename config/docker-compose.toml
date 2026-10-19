@@ -2,6 +2,7 @@
 # Alerts go to the bundled `webhook` echo service, which logs every POST.
 
 poll_interval_seconds = 10
+cursor_file = "/data/cursors.json"
 
 [[contracts]]
 label       = "Testnet XLM (native asset contract)"

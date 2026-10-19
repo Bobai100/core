@@ -2,6 +2,8 @@
 //! capped exponential back-off, unhealthy/recovered transitions, and a
 //! deterministic per-contract start offset that spreads polls out in time.
 
+#![allow(dead_code)]
+
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -92,7 +94,11 @@ impl PollOutcome {
 }
 
 /// Failure streak and last-success time for one contract.
-#[derive(Debug, Default)]
+///
+/// Cloneable so the reload path can carry health state forward for contracts
+/// whose rules did not change instead of recreating it (which would forget
+/// failure streaks and re-trigger unhealthy/recovered transitions).
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PollHealth {
     consecutive_failures: u32,
     last_success: Option<Instant>,
@@ -194,7 +200,8 @@ fn jittered(base: Duration, cap: Duration) -> Duration {
         Instant::now().hash(&mut hasher);
         (hasher.finish() % (nanos as u64 + 1)) as u128
     };
-    half.saturating_add(Duration::from_nanos(offset as u64)).min(cap)
+    half.saturating_add(Duration::from_nanos(offset as u64))
+        .min(cap)
 }
 
 #[cfg(test)]

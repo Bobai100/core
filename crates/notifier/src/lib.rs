@@ -17,7 +17,7 @@ use txwatch_rules::AlertPayload;
 
 pub mod format;
 pub mod kyc_auth;
-pub use kyc_auth::{constant_time_compare, verify_kyc_webhook};
+pub use kyc_auth::verify_kyc_webhook;
 
 const MAX_RETRIES: u32 = 3;
 
@@ -38,15 +38,7 @@ pub fn build_client() -> Result<Client> {
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
 }
 
-/// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
-/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
-/// If `secret` is Some, adds an `X-TxWatch-Secret` header to every request.
-///
-/// Delivery semantics: HTTP 2xx = success. The response body is logged at
-/// debug level but is otherwise ignored — a 200 OK with an error body is
-/// still treated as a successful delivery (#24).
-///
-/// `send_webhook` for callers that have no shutdown signal to honour.
+/// [`send_webhook`] for callers that have no shutdown signal to honour.
 ///
 /// Holds the sender for the duration of the call so the receiver never fires
 /// and retry behaviour is identical to the pre-shutdown implementation.
@@ -60,6 +52,16 @@ pub async fn send_webhook_simple(
     send_webhook(client, url, payload, secret, rx).await
 }
 
+/// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
+/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
+/// If `secret` is Some, every request carries an
+/// `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` header; see
+/// `docs/verifying-webhooks.md`.
+///
+/// Delivery semantics: HTTP 2xx = success. The response body is logged at
+/// debug level but is otherwise ignored — a 200 OK with an error body is
+/// still treated as a successful delivery (#24).
+///
 /// Returns a [`DeliveryResult`] describing how many attempts were needed.
 pub async fn send_webhook(
     client: &Client,
@@ -162,8 +164,6 @@ pub async fn send_to_destination_simple(
     send_to_destination(client, destination, payload, rx).await
 }
 
-/// POSTs `body` with retries and exponential backoff. `payload` only labels
-/// log lines.
 /// Maximum number of alerts in one batched POST; larger sets are split.
 pub const MAX_BATCH_SIZE: usize = 50;
 
@@ -330,10 +330,6 @@ async fn deliver(
     Err(err)
 }
 
-/// Build a synthetic `AlertPayload` for a network. Pass the network's own
-/// `Network::as_str()`, `horizon_base_url()` and `explorer_base_url()`: the
-/// explorer path is not the network name (mainnet is `/explorer/public`). A
-/// network without an explorer links to the transaction on Horizon instead.
 /// Contract ID used by test payloads: a valid contract StrKey (base32, contract
 /// version byte, correct CRC16 checksum) that visibly reads as synthetic, so
 /// receivers that validate or decode addresses accept it.
@@ -349,7 +345,10 @@ pub fn test_payload(label: &str) -> AlertPayload {
     )
 }
 
-/// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
+/// Build a synthetic `AlertPayload` for a network. Pass the network's own
+/// `Network::as_str()`, `horizon_base_url()` and `explorer_base_url()`: the
+/// explorer path is not the network name (mainnet is `/explorer/public`). A
+/// network without an explorer links to the transaction on Horizon instead.
 ///
 /// `label` is used as-is. The webhook URL is deliberately not part of the
 /// payload: receivers often forward alerts to chat, and URLs can embed tokens.
@@ -621,6 +620,43 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
         assert_eq!(sig, &expected);
+    }
+
+    /// Test vector published in `docs/verifying-webhooks.md`; keep both in sync.
+    #[tokio::test]
+    async fn signature_matches_documented_test_vector() {
+        const BODY: &str = r#"{"alert_id":"test-vector","amount":"100.0000000"}"#;
+        const SECRET: &str = "whsec_test_vector";
+        const SIGNATURE: &str =
+            "sha256=0330f633146e241611d9308f5c7d38cb97ad862c0a2a22895889208691a9d691";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        deliver(
+            &client,
+            &url,
+            BODY.to_owned(),
+            Some(SECRET),
+            &WebhookHeaders::default(),
+            &sample_payload(),
+            dummy_shutdown(),
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[0].body, BODY.as_bytes());
+        assert_eq!(
+            requests[0].headers.get("x-txwatch-signature").unwrap(),
+            SIGNATURE
+        );
     }
 
     #[tokio::test]

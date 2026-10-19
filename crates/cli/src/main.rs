@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::IsTerminal,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -46,7 +47,7 @@ struct Cli {
     log_format: LogFormat,
 
     /// Override the Horizon base URL for every contract (e.g. a private Horizon instance)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_horizon_url)]
     horizon_url: Option<String>,
 
     #[command(subcommand)]
@@ -63,6 +64,27 @@ enum LogFormat {
 enum OutputFormat {
     Text,
     Json,
+}
+
+/// Network names accepted by `test-webhook --network`. `public` and `pubnet`
+/// are the names Stellar Expert uses for mainnet.
+#[derive(Clone, Copy, ValueEnum)]
+enum NetworkArg {
+    Mainnet,
+    #[value(alias = "public", alias = "pubnet")]
+    MainnetAlias,
+    Testnet,
+    Futurenet,
+}
+
+impl NetworkArg {
+    fn to_network(self) -> txwatch_config::Network {
+        match self {
+            NetworkArg::Mainnet | NetworkArg::MainnetAlias => txwatch_config::Network::Mainnet,
+            NetworkArg::Testnet => txwatch_config::Network::Testnet,
+            NetworkArg::Futurenet => txwatch_config::Network::Futurenet,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -82,6 +104,14 @@ enum Command {
         /// Run a single poll cycle, deliver alerts, save cursors and exit
         #[arg(long)]
         once: bool,
+
+        /// Reload configuration when the config file or included files change
+        #[arg(long, env = "TXWATCH_WATCH_CONFIG")]
+        watch_config: bool,
+
+        /// Maximum number of contracts polled concurrently
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -97,8 +127,10 @@ enum Command {
         check_horizon: bool,
 
         /// Output format. `json` prints the parsed config (secrets redacted) or the
-        /// validation error as a single JSON object on stdout.
-        #[arg(long, value_enum, default_value = "text", conflicts_with_all = ["check_webhooks", "check_horizon"])]
+        /// validation error as a single JSON object on stdout. Webhook and Horizon
+        /// check results are included in the JSON output when the respective flags
+        /// are also passed.
+        #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
 
@@ -114,8 +146,17 @@ enum Command {
         #[arg(long, default_value = "TxWatch Test")]
         label: String,
 
-        #[arg(long, default_value = "testnet")]
-        network: String,
+        /// Stellar network for the test payload
+        #[arg(long, value_enum, default_value = "testnet")]
+        network: NetworkArg,
+
+        /// Horizon base URL for a custom network in the test payload
+        #[arg(long, value_parser = parse_horizon_url)]
+        horizon_url: Option<String>,
+
+        /// Explorer base URL for a custom network in the test payload
+        #[arg(long, value_parser = parse_horizon_url)]
+        explorer_url: Option<String>,
 
         /// Send to every destination of this configured contract instead of --url
         #[arg(long)]
@@ -159,13 +200,26 @@ enum Command {
         #[arg(long)]
         contract_id: Option<String>,
 
-        /// Stellar network: mainnet, testnet or futurenet
+        /// Stellar network: mainnet, testnet, futurenet, or a custom horizon-url
         #[arg(long)]
         network: Option<String>,
+
+        /// Override the Horizon base URL for this contract (implies a custom network)
+        #[arg(long)]
+        horizon_url: Option<String>,
 
         /// URL that receives webhook alerts
         #[arg(long)]
         webhook_url: Option<String>,
+
+        /// Human-readable label for this contract (default: "My Contract")
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Alert rule preset to add; repeatable. Choices: any-transaction, failed,
+        /// admin, large-transfer=<xlm>, high-fee=<stroops>, function=<name>
+        #[arg(long = "rule", value_name = "PRESET")]
+        rules: Vec<String>,
 
         /// Where to write the config
         #[arg(long, default_value = "txwatch.toml")]
@@ -174,6 +228,10 @@ enum Command {
         /// Overwrite the output file if it already exists
         #[arg(long)]
         force: bool,
+
+        /// Never prompt; fail immediately if a required value is missing
+        #[arg(long)]
+        non_interactive: bool,
     },
 
     /// Evaluate a contract's rules against one historical transaction
@@ -193,6 +251,16 @@ enum Command {
         #[arg(long)]
         send: bool,
     },
+
+    /// Remove saved cursor entries for contracts that are no longer configured
+    ///
+    /// Reloads keep cursors of removed contracts so re-adding one resumes where
+    /// it left off; use this command to intentionally discard them.
+    PruneCursors {
+        /// Only report what would be removed, without writing the cursor file
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -205,18 +273,116 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate {
             format: OutputFormat::Json,
-            ..
-        } => match AppConfig::from_file(&required_config(&cli.config)?) {
-            Ok(cfg) => println!(
-                "{}",
-                serde_json::to_string_pretty(&config_summary_json(&cfg))?
-            ),
-            Err(e) => {
-                let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
-                println!("{}", serde_json::to_string_pretty(&error)?);
-                std::process::exit(1);
+            check_webhooks,
+            check_horizon,
+        } => {
+            let cfg = match AppConfig::from_file(&required_config(&cli.config)?) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
+                    println!("{}", serde_json::to_string_pretty(&error)?);
+                    std::process::exit(1);
+                }
+            };
+            let mut summary = config_summary_json(&cfg);
+
+            // Optionally run webhook checks and embed results.
+            if check_webhooks {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .context("failed to build HTTP client")?;
+                let targets: Vec<(String, String)> = cfg
+                    .contracts
+                    .iter()
+                    .flat_map(|c| {
+                        c.destinations()
+                            .into_iter()
+                            .map(move |d| (c.label.clone(), d.url))
+                    })
+                    .collect();
+                let results = join_all(targets.into_iter().map(|(label, url)| {
+                    let client = &client;
+                    async move {
+                        let result = check_webhook_reachable(client, &url).await;
+                        (label, url, result)
+                    }
+                }))
+                .await;
+                let mut webhook_checks = Vec::new();
+                let mut any_failed = false;
+                for (label, url, result) in results {
+                    let (ok, status, error) = match result {
+                        Ok(s) => {
+                            let failed = s == "method not allowed";
+                            if failed {
+                                any_failed = true;
+                            }
+                            (true, s.to_owned(), None)
+                        }
+                        Err(e) => {
+                            any_failed = true;
+                            (false, "unreachable".to_owned(), Some(format!("{:#}", e)))
+                        }
+                    };
+                    let mut entry = serde_json::json!({
+                        "contract": label,
+                        "url": url,
+                        "ok": ok,
+                        "status": status,
+                    });
+                    if let Some(err) = error {
+                        entry["error"] = serde_json::Value::from(err);
+                    }
+                    webhook_checks.push(entry);
+                }
+                summary["webhook_checks"] = serde_json::Value::from(webhook_checks);
+                if any_failed {
+                    summary["valid"] = serde_json::Value::Bool(false);
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                    std::process::exit(1);
+                }
             }
-        },
+
+            // Optionally run Horizon checks and embed results.
+            if check_horizon {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .context("failed to build HTTP client")?;
+                let checks = join_all(
+                    cfg.contracts
+                        .iter()
+                        .map(|c| check_horizon_contract(&client, c)),
+                )
+                .await;
+                let mut any_failed = false;
+                let horizon_checks: Vec<serde_json::Value> = checks
+                    .into_iter()
+                    .map(|check| {
+                        if !check.reachable || !check.found {
+                            any_failed = true;
+                        }
+                        serde_json::json!({
+                            "network": check.network,
+                            "status": check.status,
+                            "latest_ledger": check.latest_ledger,
+                            "reachable": check.reachable,
+                            "found": check.found,
+                            "message": check.message,
+                        })
+                    })
+                    .collect();
+                summary["horizon_checks"] = serde_json::Value::from(horizon_checks);
+                if any_failed {
+                    summary["valid"] = serde_json::Value::Bool(false);
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                    std::process::exit(1);
+                }
+            }
+
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
 
         Command::Validate {
             check_webhooks,
@@ -254,7 +420,7 @@ async fn main() -> Result<()> {
                 for entry in &c.rules {
                     println!("      - {}", entry.rule.label());
                 }
-                println!("    horizon      : {}", c.network.horizon_base_url());
+                println!("    horizon      : {}", poll_base_url(c));
                 match c.network.explorer_base_url() {
                     Some(explorer) => {
                         println!("    explorer     : {}/contract/{}", explorer, c.contract_id)
@@ -340,6 +506,8 @@ async fn main() -> Result<()> {
             url,
             label,
             network,
+            horizon_url,
+            explorer_url,
             contract,
             secret,
             format,
@@ -350,29 +518,27 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|wanted| {
                     let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
-                    cfg.contracts
-                        .into_iter()
-                        .find(|c| c.label == *wanted)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("configured contract '{}' not found", wanted)
-                        })
+                    find_contract_by_label(&cfg, wanted)
                 })
                 .transpose()?;
-            let (destinations, network) = if let Some(c) = configured {
+            let (destinations, network, horizon, explorer) = if let Some(c) = configured {
                 let mut destinations = c.destinations();
                 if secret.is_some() {
                     for destination in &mut destinations {
                         destination.secret = secret.clone();
                     }
                 }
-                (destinations, c.network)
+                let horizon = poll_base_url(&c).to_string();
+                let explorer = c.network.explorer_base_url().map(str::to_string);
+                (destinations, c.network, horizon, explorer)
             } else {
-                let selected = match network.as_str() {
-                    "mainnet" => txwatch_config::Network::Mainnet,
-                    "testnet" => txwatch_config::Network::Testnet,
-                    "futurenet" => txwatch_config::Network::Futurenet,
-                    other => return Err(anyhow::anyhow!("unknown network '{}'", other)),
-                };
+                let selected = network.to_network();
+                let horizon = horizon_url
+                    .clone()
+                    .unwrap_or_else(|| selected.horizon_base_url().to_string());
+                let explorer = explorer_url
+                    .clone()
+                    .or_else(|| selected.explorer_base_url().map(str::to_string));
                 let destination = WebhookDestination {
                     url: url.ok_or_else(|| {
                         anyhow::anyhow!("--url is required unless --contract is provided")
@@ -384,7 +550,7 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 };
                 destination.validate()?;
-                (vec![destination], selected)
+                (vec![destination], selected, horizon, explorer)
             };
             let client = build_client().context("failed to build HTTP client")?;
 
@@ -394,8 +560,8 @@ async fn main() -> Result<()> {
                 let payload = test_payload_with_network(
                     &label,
                     network.as_str(),
-                    network.horizon_base_url(),
-                    network.explorer_base_url(),
+                    &horizon,
+                    explorer.as_deref(),
                 );
                 info!(url = %destination.url, format = %destination.format, "sending test webhook");
                 match send_to_destination_simple(&client, destination, &payload).await {
@@ -421,30 +587,121 @@ async fn main() -> Result<()> {
         Command::Init {
             ref contract_id,
             ref network,
+            ref horizon_url,
             ref webhook_url,
+            ref label,
+            ref rules,
             ref output,
             force,
+            non_interactive,
         } => {
+            // #228: detect non-TTY stdin or explicit --non-interactive flag
+            let interactive = !non_interactive && std::io::stdin().is_terminal();
+
+            // If not interactive, collect all missing required fields upfront and fail.
+            if !interactive {
+                let mut missing: Vec<&str> = Vec::new();
+                if contract_id.is_none() {
+                    missing.push("--contract-id");
+                }
+                if webhook_url.is_none() {
+                    missing.push("--webhook-url");
+                }
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "stdin is not a terminal; the following required flags are missing: {}",
+                        missing.join(", ")
+                    );
+                }
+            }
+
+            // #229: Validate --network before prompting for anything else.
+            if let Some(n) = network.as_deref() {
+                if n != "mainnet"
+                    && n != "testnet"
+                    && n != "futurenet"
+                    && horizon_url.is_none()
+                {
+                    anyhow::bail!(
+                        "unknown network '{}'; use mainnet, testnet, futurenet, or pass --horizon-url for a custom network",
+                        n
+                    );
+                }
+            }
+
+            // #227: check file existence before any prompts
             if output.exists() && !force {
                 return Err(anyhow::anyhow!(
                     "'{}' already exists; pass --force to overwrite it",
                     output.display()
                 ));
             }
-            let contract_id = value_or_prompt(contract_id, "Contract ID (C...)")?;
+
+            let contract_id = if interactive {
+                value_or_prompt(contract_id, "Contract ID (C...)")?
+            } else {
+                contract_id.clone().unwrap()
+            };
+
             let network = match network {
                 Some(n) => n.clone(),
-                None => prompt("Network [testnet]")?
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "testnet".into()),
+                None => {
+                    if interactive {
+                        prompt("Network [testnet]")?
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "testnet".into())
+                    } else {
+                        "testnet".into()
+                    }
+                }
             };
-            let webhook_url = value_or_prompt(webhook_url, "Webhook URL")?;
 
-            let raw = render_init_config(&contract_id, &network, &webhook_url)?;
+            let webhook_url = if interactive {
+                value_or_prompt(webhook_url, "Webhook URL")?
+            } else {
+                webhook_url.clone().unwrap()
+            };
+
+            // #229: label and horizon_url
+            let label = match label {
+                Some(l) => l.clone(),
+                None => {
+                    if interactive {
+                        prompt("Contract label [My Contract]")?
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "My Contract".into())
+                    } else {
+                        "My Contract".into()
+                    }
+                }
+            };
+
+            let raw = render_init_config(
+                &contract_id,
+                &network,
+                horizon_url.as_deref(),
+                &webhook_url,
+                &label,
+                rules,
+            )?;
+
             // Validate with the config crate before touching the filesystem.
             AppConfig::parse(&raw, output).context("the generated config is not valid")?;
-            fs::write(output, raw)
-                .with_context(|| format!("failed to write '{}'", output.display()))?;
+
+            // #227: use create_new(true) to avoid TOCTOU race, unless --force
+            write_config_file(output, &raw, force)?;
+
+            // Write to a sibling temp file and rename over the target so an
+            // interrupted write never leaves a truncated config. `fs::rename`
+            // replaces an existing file atomically on Unix and on Windows
+            // (via MoveFileEx with MOVEFILE_REPLACE_EXISTING).
+            let tmp = output.with_extension("toml.tmp");
+            fs::write(&tmp, raw)
+                .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+            fs::rename(&tmp, output).with_context(|| {
+                let _ = fs::remove_file(&tmp);
+                format!("failed to write '{}'", output.display())
+            })?;
             println!(
                 "Wrote {}. Check it with: txwatch --config {} validate",
                 output.display(),
@@ -475,11 +732,7 @@ async fn main() -> Result<()> {
             send,
         } => {
             let cfg = load_config(&cli)?;
-            let contract = cfg
-                .contracts
-                .into_iter()
-                .find(|c| c.label == *contract)
-                .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract))?;
+            let contract = find_contract_by_label(&cfg, contract)?;
             let client = build_client().context("failed to build HTTP client")?;
 
             let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
@@ -521,6 +774,26 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::PruneCursors { dry_run } => {
+            let cfg = load_config(&cli)?;
+            let removed = prune_cursors(&cfg.cursor_file, &cfg, dry_run)?;
+            if removed.is_empty() {
+                println!("No stale cursor entries found in '{}'.", cfg.cursor_file);
+            } else {
+                let verb = if dry_run { "Would remove" } else { "Removed" };
+                println!(
+                    "{} {} stale cursor entr{} from '{}':",
+                    verb,
+                    removed.len(),
+                    if removed.len() == 1 { "y" } else { "ies" },
+                    cfg.cursor_file
+                );
+                for key in &removed {
+                    println!("  - {}", key);
+                }
+            }
+        }
+
         Command::Schema => println!(
             "{}",
             serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?
@@ -529,20 +802,24 @@ async fn main() -> Result<()> {
         Command::Watch {
             dry_run,
             once,
+            watch_config,
+            concurrency,
             #[cfg(feature = "metrics")]
             metrics_addr,
         } => {
             let config_path = required_config(&cli.config)?;
             let cfg = load_config(&cli)?;
+            let concurrency = concurrency.max(1);
 
             if once {
                 info!(
                     version = VERSION,
                     contracts = cfg.contracts.len(),
                     dry_run,
+                    concurrency,
                     "running a single TxWatch poll cycle"
                 );
-                let report = txwatch_poller::run_once(cfg, dry_run).await?;
+                let report = txwatch_poller::run_once(cfg, dry_run, concurrency).await?;
                 info!(
                     transactions = report.transactions,
                     alerts = report.alerts,
@@ -562,36 +839,88 @@ async fn main() -> Result<()> {
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    warn!(error = ?e, "failed to install Ctrl+C handler");
-                    return;
-                }
-                let _ = shutdown_tx.send(true);
-            });
+            spawn_signal_handlers(shutdown_tx);
 
             #[cfg(feature = "metrics")]
             if let Some(addr) = metrics_addr {
                 // Register before serving so the first scrape already has it.
-                txwatch_poller::metrics::register_build_info();
+                txwatch_poller::metrics::register_build_info(
+                    env!("CARGO_PKG_VERSION"),
+                    env!("TXWATCH_GIT_SHA"),
+                );
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
+            // On Unix this installs a SIGHUP handler; on Windows it is a no-op.
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
-            spawn_reload_on_sighup(config_path, reload_tx)?;
+            spawn_reload_on_sighup(
+                config_path.clone(),
+                cli.horizon_url.clone(),
+                reload_tx.clone(),
+            )?;
+
+            let watch_enabled = watch_config || cfg!(windows);
+            if watch_enabled {
+                spawn_config_watcher(config_path, reload_tx, cli.horizon_url.clone());
+            }
 
             info!(
                 version = VERSION,
                 contracts = cfg.contracts.len(),
                 interval_secs = cfg.poll_interval_seconds,
                 dry_run = dry_run,
+                concurrency,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_reload(cfg, dry_run, shutdown_rx, reload_rx).await?;
+            txwatch_poller::run_with_reload(cfg, dry_run, concurrency, shutdown_rx, reload_rx)
+                .await?;
         }
     }
 
     Ok(())
 }
+/// Write the config file atomically:
+///  - Without `--force`: use `create_new(true)` so a file created between the
+///    existence check and the write is never silently overwritten (TOCTOU fix, #227).
+///  - With `--force`: truncate and overwrite.
+/// On Unix the file is created with 0600 permissions since it may hold a
+/// webhook secret.
+fn write_config_file(path: &Path, content: &str, force: bool) -> Result<()> {
+    // Build the OpenOptions depending on mode.
+    let file = if force {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    } else {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
+    .with_context(|| {
+        if force {
+            format!("failed to open '{}' for writing", path.display())
+        } else {
+            format!(
+                "'{}' already exists; pass --force to overwrite it",
+                path.display()
+            )
+        }
+    })?;
+
+    // Set 0600 permissions on Unix before writing any content.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on '{}'", path.display()))?;
+    }
+
+    use std::io::Write;
+    let mut file = file;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("failed to write '{}'", path.display()))?;
+    Ok(())
+}
+
 /// Read one trimmed line from stdin after printing `label`; `None` on EOF.
 fn prompt(label: &str) -> Result<Option<String>> {
     use std::io::{BufRead, Write};
@@ -614,28 +943,111 @@ fn value_or_prompt(value: &Option<String>, label: &str) -> Result<String> {
     }
 }
 
-/// Starter config for `txwatch init`: one contract and an AnyTransaction rule.
-fn render_init_config(contract_id: &str, network: &str, webhook_url: &str) -> Result<String> {
+/// Starter config for `txwatch init`.
+///
+/// Supported rule presets (via `--rule`):
+///   any-transaction        → type = "AnyTransaction"
+///   failed                 → type = "TransactionFailed"
+///   admin                  → type = "AdminFunctionCalled" with common admin function names
+///   large-transfer=<xlm>   → type = "LargeTransfer" with threshold_xlm = <xlm>
+///   high-fee=<stroops>     → type = "HighFee" with threshold_stroops = <stroops>
+///   function=<name>        → type = "FunctionCalled" with function_name = <name>
+fn render_init_config(
+    contract_id: &str,
+    network: &str,
+    horizon_url: Option<&str>,
+    webhook_url: &str,
+    label: &str,
+    rule_presets: &[String],
+) -> Result<String> {
     // TOML basic strings share JSON's escaping, so serde_json quotes values safely.
     let quote = |s: &str| serde_json::to_string(s);
+
+    // Build rule TOML snippets from presets; default to AnyTransaction if none given.
+    let rule_toml = if rule_presets.is_empty() {
+        "  [[contracts.rules]]\n  type = \"AnyTransaction\"\n".to_owned()
+    } else {
+        let mut parts = String::new();
+        for preset in rule_presets {
+            let snippet = parse_rule_preset(preset)?;
+            parts.push_str(&snippet);
+        }
+        parts
+    };
+
+    // Optional horizon_url override line.
+    let horizon_line = match horizon_url {
+        Some(url) => format!("horizon_url = {}\n", quote(url)?),
+        None => String::new(),
+    };
+
     Ok(format!(
         r#"# Generated by `txwatch init`. See docs/configuration.md for every option.
 poll_interval_seconds = 10
 
 [[contracts]]
-label       = "My Contract"
+label       = {label}
 contract_id = {contract_id}
 network     = {network}
-webhook_url = {webhook_url}
+{horizon_line}webhook_url = {webhook_url}
 # webhook_secret = "${{TXWATCH_WEBHOOK_SECRET}}"   # optional: signs each webhook
 
-  [[contracts.rules]]
-  type = "AnyTransaction"
-"#,
+{rule_toml}"#,
+        label = quote(label)?,
         contract_id = quote(contract_id)?,
         network = quote(network)?,
+        horizon_line = horizon_line,
         webhook_url = quote(webhook_url)?,
+        rule_toml = rule_toml,
     ))
+}
+
+/// Convert a `--rule` preset string into TOML snippet(s).
+fn parse_rule_preset(preset: &str) -> Result<String> {
+    let quote = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
+    if preset.eq_ignore_ascii_case("any-transaction") {
+        Ok("  [[contracts.rules]]\n  type = \"AnyTransaction\"\n".to_owned())
+    } else if preset.eq_ignore_ascii_case("failed") {
+        Ok("  [[contracts.rules]]\n  type = \"TransactionFailed\"\n".to_owned())
+    } else if preset.eq_ignore_ascii_case("admin") {
+        Ok(concat!(
+            "  [[contracts.rules]]\n",
+            "  type           = \"AdminFunctionCalled\"\n",
+            "  function_names = [\"set_admin\", \"upgrade\", \"initialize\"]\n",
+        )
+        .to_owned())
+    } else if let Some(rest) = preset.strip_prefix("large-transfer=") {
+        let xlm: u64 = rest.parse().with_context(|| {
+            format!(
+                "invalid large-transfer preset '{}': expected large-transfer=<xlm>",
+                preset
+            )
+        })?;
+        Ok(format!(
+            "  [[contracts.rules]]\n  type          = \"LargeTransfer\"\n  threshold_xlm = {xlm}\n"
+        ))
+    } else if let Some(rest) = preset.strip_prefix("high-fee=") {
+        let stroops: u64 = rest.parse().with_context(|| {
+            format!(
+                "invalid high-fee preset '{}': expected high-fee=<stroops>",
+                preset
+            )
+        })?;
+        Ok(format!(
+            "  [[contracts.rules]]\n  type               = \"HighFee\"\n  threshold_stroops = {stroops}\n"
+        ))
+    } else if let Some(rest) = preset.strip_prefix("function=") {
+        Ok(format!(
+            "  [[contracts.rules]]\n  type          = \"FunctionCalled\"\n  function_name = {}\n",
+            quote(rest)
+        ))
+    } else {
+        anyhow::bail!(
+            "unknown rule preset '{}'; valid presets: any-transaction, failed, admin, \
+             large-transfer=<xlm>, high-fee=<stroops>, function=<name>",
+            preset
+        )
+    }
 }
 
 /// The config path from `--config`, `TXWATCH_CONFIG` or the `./txwatch.toml`
@@ -651,11 +1063,75 @@ fn required_config(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Forward SIGINT, SIGTERM and SIGQUIT into `shutdown_tx` so containers and
+/// systemd (`docker stop`, Kubernetes) shut down cleanly. A second SIGINT
+/// forces an immediate exit.
+#[cfg(unix)]
+fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGINT handler");
+            return;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGTERM handler");
+            return;
+        }
+    };
+    let mut sigquit = match signal(SignalKind::quit()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGQUIT handler");
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let mut shutting_down = false;
+        loop {
+            let is_sigint = tokio::select! {
+                _ = sigint.recv() => true,
+                _ = sigterm.recv() => false,
+                _ = sigquit.recv() => false,
+            };
+            if shutting_down {
+                if is_sigint {
+                    error!("second SIGINT received — exiting immediately, state may not be flushed");
+                    std::process::exit(130);
+                }
+                continue;
+            }
+            shutting_down = true;
+            info!("shutting down, press Ctrl-C again to force");
+            let _ = shutdown_tx.send(true);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = ?e, "failed to install Ctrl+C handler");
+            return;
+        }
+        info!("shutting down, press Ctrl-C again to force");
+        let _ = shutdown_tx.send(true);
+    });
+}
+
 /// On SIGHUP, re-read and validate the config file and hand it to the poller.
 /// An invalid file is logged and ignored, so the previous config keeps running.
 #[cfg(unix)]
 fn spawn_reload_on_sighup(
     path: PathBuf,
+    horizon_url: Option<String>,
     reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -664,7 +1140,7 @@ fn spawn_reload_on_sighup(
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
             info!(path = %path.display(), "SIGHUP received — reloading config");
-            if let Some(cfg) = reload_config(&path) {
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
                 if reload_tx.send(cfg).await.is_err() {
                     break;
                 }
@@ -674,23 +1150,128 @@ fn spawn_reload_on_sighup(
     Ok(())
 }
 
+/// Windows has no SIGHUP, so config reloading is a no-op there. The poller
+/// still runs normally; restart the process to pick up a changed config.
 #[cfg(not(unix))]
 fn spawn_reload_on_sighup(
     _path: PathBuf,
+    _horizon_url: Option<String>,
     _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
+    info!("SIGHUP config reload is not supported on this platform; restart to reload");
     Ok(())
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
-fn reload_config(path: &Path) -> Option<AppConfig> {
+/// Watches the configuration file and any included files for changes.
+/// Debounces changes to prevent partial reads and correctly detects
+/// symlink swaps (common in Kubernetes ConfigMap volume mounts).
+fn spawn_config_watcher(
+    path: PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
+    horizon_url: Option<String>,
+) {
+    tokio::spawn(async move {
+        let mut last_hash = txwatch_config::compute_config_hash(&path).ok();
+        let poll_interval = Duration::from_millis(250);
+        let debounce_interval = Duration::from_millis(250);
+
+        loop {
+            tokio::time::sleep(poll_interval).await;
+
+            let current_hash = match txwatch_config::compute_config_hash(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if last_hash.as_ref() == Some(&current_hash) {
+                continue;
+            }
+
+            // Debounce: wait until hash is stable across debounce_interval
+            tokio::time::sleep(debounce_interval).await;
+            let debounced_hash = match txwatch_config::compute_config_hash(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if debounced_hash != current_hash {
+                continue;
+            }
+
+            last_hash = Some(debounced_hash);
+            info!(path = %path.display(), "config file change detected — reloading config");
+
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
+                if reload_tx.send(cfg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Re-read and validate the config file.
+fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
-        Ok(cfg) => Some(cfg),
+        Ok(mut cfg) => {
+            if let Some(url) = horizon_url {
+                let url = url.trim_end_matches('/');
+                for c in &mut cfg.contracts {
+                    c.horizon_base_url_override = Some(url.to_string());
+                }
+            }
+            Some(cfg)
+        }
         Err(e) => {
             error!(error = %format!("{:#}", e), "config reload failed — keeping the previous config");
             None
         }
     }
+}
+
+/// Remove cursor entries whose `<network>:<contract_id>` key matches no
+/// configured contract. Returns the removed keys. When `dry_run` is set the
+/// file is left untouched.
+fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<String>> {
+    let path = Path::new(path);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read cursor file '{}'", path.display()))?;
+    let mut cursors: std::collections::BTreeMap<String, String> = if raw.trim().is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse cursor file '{}'", path.display()))?
+    };
+
+    let configured: std::collections::HashSet<String> = cfg
+        .contracts
+        .iter()
+        .map(|c| format!("{}:{}", c.network.as_str(), c.contract_id))
+        .collect();
+
+    let stale: Vec<String> = cursors
+        .keys()
+        .filter(|key| !configured.contains(*key))
+        .cloned()
+        .collect();
+
+    if !dry_run && !stale.is_empty() {
+        for key in &stale {
+            cursors.remove(key);
+        }
+        let serialized = serde_json::to_string_pretty(&cursors)?;
+        // Write to a sibling temp file and rename so a crash can't truncate it.
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, serialized)
+            .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("failed to replace '{}'", path.display()))?;
+    }
+
+    Ok(stale)
 }
 
 /// Load the config and apply `--horizon-url`, if given, to every contract.
@@ -705,6 +1286,57 @@ fn load_config(cli: &Cli) -> Result<AppConfig> {
     Ok(cfg)
 }
 
+/// The Horizon base URL actually used to poll `contract`: the per-contract
+/// override (including `--horizon-url`) when set, otherwise the network default.
+fn poll_base_url(contract: &txwatch_config::WatchedContract) -> &str {
+    contract
+        .horizon_base_url_override
+        .as_deref()
+        .unwrap_or_else(|| contract.network.horizon_base_url())
+}
+
+/// Find a configured contract by label, matching case-insensitively after
+/// trimming (config validation treats such labels as duplicates). On a miss the
+/// error lists the configured labels.
+fn find_contract_by_label(
+    cfg: &AppConfig,
+    wanted: &str,
+) -> Result<txwatch_config::WatchedContract> {
+    let wanted = wanted.trim();
+    cfg.contracts
+        .iter()
+        .find(|c| c.label.trim().eq_ignore_ascii_case(wanted))
+        .cloned()
+        .ok_or_else(|| {
+            let labels: Vec<&str> = cfg.contracts.iter().map(|c| c.label.as_str()).collect();
+            if labels.is_empty() {
+                anyhow::anyhow!(
+                    "configured contract '{}' not found (no contracts are configured)",
+                    wanted
+                )
+            } else {
+                anyhow::anyhow!(
+                    "configured contract '{}' not found; configured labels: {}",
+                    wanted,
+                    labels.join(", ")
+                )
+            }
+        })
+}
+
+/// Validate a `--horizon-url` / `--explorer-url` value: it must be an absolute
+/// http(s) URL. Trailing slashes are trimmed so the stored value is canonical.
+fn parse_horizon_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("URL must not be empty".to_string());
+    }
+    if let Err(e) = txwatch_config::check_http_url(trimmed) {
+        return Err(format!("invalid URL '{}': {:#}", value, e));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Machine-readable `validate` summary. Webhook secrets are never printed;
 /// only whether one is set.
 fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
@@ -712,15 +1344,27 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
         .contracts
         .iter()
         .map(|c| {
-            let rules: Vec<_> = c.rules.iter().map(|entry| {
-                let mut obj = serde_json::to_value(&entry.rule)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                let map = obj.as_object_mut().unwrap();
-                if let Some(cooldown) = entry.cooldown_seconds {
-                    map.insert("cooldown_seconds".to_string(), serde_json::json!(cooldown));
-                }
-                serde_json::Value::Object(map.clone())
-            }).collect();
+            let rules: Vec<_> = c
+                .rules
+                .iter()
+                .map(|entry| {
+                    let mut obj = serde_json::to_value(&entry.rule)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(cooldown) = entry.cooldown_seconds {
+                        if let Some(map) = obj.as_object_mut() {
+                            map.insert(
+                                "cooldown_seconds".to_string(),
+                                serde_json::json!(cooldown),
+                            );
+                        }
+                    }
+                    obj
+                })
+                .collect();
+            let horizon_url = c
+                .horizon_base_url_override
+                .as_deref()
+                .unwrap_or_else(|| c.network.horizon_base_url());
             serde_json::json!({
                 "label": c.label,
                 "contract_id": c.contract_id,
@@ -730,12 +1374,9 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "webhook_url": c.webhook_url,
                 "webhook_secret_set": c.webhook_secret.is_some(),
                 "rules": rules,
-                "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url().unwrap_or(""), c.contract_id),
-                "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
-                "rules": c.rules,
-                "horizon_url": c.network.horizon_base_url(),
+                "horizon_url": horizon_url,
                 "explorer_url": c.network.explorer_base_url().map(|e| format!("{}/contract/{}", e, c.contract_id)),
+                "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -862,10 +1503,7 @@ async fn check_horizon_contract(
     client: &Client,
     contract: &txwatch_config::WatchedContract,
 ) -> HorizonCheck {
-    let base = contract
-        .horizon_base_url_override
-        .as_deref()
-        .unwrap_or_else(|| contract.network.horizon_base_url());
+    let base = poll_base_url(contract);
     let root = client.get(base).send().await;
     let (reachable, latest_ledger) = match root {
         Ok(response) if response.status().is_success() => {
