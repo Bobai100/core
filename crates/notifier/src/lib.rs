@@ -368,12 +368,15 @@ pub fn test_payload_with_network(
         schema_version: 1,
         // Unique per send, so repeated tests are not de-duplicated by receivers.
         alert_id: txwatch_rules::alert_id(
+            network,
             TEST_CONTRACT_ID,
             tx_hash,
+            rule_type,
             &format!(
                 "TestWebhook@{}",
                 now.timestamp_nanos_opt().unwrap_or_default()
             ),
+            0,
         ),
         label: label.to_string(),
         contract_id: TEST_CONTRACT_ID.into(),

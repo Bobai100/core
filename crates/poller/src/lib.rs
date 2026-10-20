@@ -1535,6 +1535,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         label: &contract.label,
         contract_id: &contract.contract_id,
         network: contract.network.as_str(),
+        network_id: contract.network.cursor_id(),
         horizon_base: canonical_base,
         explorer_base: contract.network.explorer_base_url(),
     };
@@ -1779,6 +1780,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         }
         if let Some(payload) = check_no_activity(
             &rule.rule,
+            idx,
             state.last_seen,
             now,
             &mut state.no_activity_states[idx],
@@ -2061,6 +2063,7 @@ fn evaluate_contract(
         label: &contract.label,
         contract_id: &contract.contract_id,
         network: contract.network.as_str(),
+        network_id: contract.network.cursor_id(),
         horizon_base,
         explorer_base: contract.network.explorer_base_url(),
     };

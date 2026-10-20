@@ -541,8 +541,9 @@ pub struct AlertPayload {
     /// breaking changes (field removals or renames) bump it.
     pub schema_version: u32,
     /// Stable, deterministic alert identifier derived from
-    /// (network, contract_id, tx hash, rule_type, rule params) via SHA-256
-    /// (issue #57). Receivers should deduplicate on this value.
+    /// (network cursor ID, contract_id, tx hash, rule_type, rule_triggered,
+    /// rule index) via SHA-256 (issues #57, #252). Receivers should
+    /// deduplicate on this value.
     /// Used as the PagerDuty `dedup_key`.
     #[serde(default)]
     pub alert_id: String,
@@ -647,15 +648,37 @@ pub struct AlertPayload {
 }
 
 /// Deterministic alert ID: the first 32 hex characters (128 bits) of
-/// SHA-256 over `contract_id`, `transaction_hash` and `rule_triggered`.
-pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str) -> String {
+/// SHA-256 over the network cursor ID, `contract_id`, `transaction_hash`,
+/// `rule_type`, `rule_triggered` and the rule's index within its contract's
+/// rule list.
+///
+/// Both the network and the rule identity are hashed (#252): two rules with
+/// identical labels on one contract (e.g. two `LargeTransfer(>=100XLM)` rules
+/// routed to different webhooks) must produce different IDs, otherwise
+/// receivers deduplicate one of them away. `rule_index` is the position of the
+/// rule in its contract's `rules` list, so it stays stable for a given config.
+pub fn alert_id(
+    network: &str,
+    contract_id: &str,
+    transaction_hash: &str,
+    rule_type: &str,
+    rule_triggered: &str,
+    rule_index: usize,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for part in [contract_id, transaction_hash, rule_triggered] {
+    for part in [
+        network,
+        contract_id,
+        transaction_hash,
+        rule_type,
+        rule_triggered,
+    ] {
         hasher.update(part.as_bytes());
         // Separator so ("ab", "c") and ("a", "bc") differ.
         hasher.update([0u8]);
     }
+    hasher.update(rule_index.to_le_bytes());
     let mut id = hex::encode(hasher.finalize());
     id.truncate(32);
     id
@@ -705,6 +728,10 @@ pub struct EvalContext<'a> {
     pub contract_id: &'a str,
     /// Network the contract lives on (`"mainnet"`, `"testnet"`, …).
     pub network: &'a str,
+    /// Network cursor ID ([`txwatch_config::Network::cursor_id`]): the stable
+    /// per-network identity used in `alert_id` (#252). Unlike `network`, this
+    /// tells two custom networks apart (`"custom@https://…"`, see issue #252).
+    pub network_id: String,
     /// Horizon base URL used to build transaction links.
     pub horizon_base: &'a str,
     /// Explorer base URL for the network; `None` for custom networks that
@@ -725,6 +752,7 @@ impl<'a> EvalContext<'a> {
             label: &contract.label,
             contract_id: &contract.contract_id,
             network: contract.network.as_str(),
+            network_id: contract.network.cursor_id(),
             horizon_base,
             explorer_base: contract.network.explorer_base_url(),
         }
@@ -808,49 +836,61 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
 
     rules
         .iter()
-        .filter(|entry| entry.enabled())
-        .filter_map(|entry| {
+        .enumerate()
+        .filter(|(_, entry)| entry.enabled())
+        .filter_map(|(rule_index, entry)| {
             let rule: &AlertRule = entry.as_ref();
             match eval_rule(rule, tx) {
-                Ok(true) => Some(AlertPayload {
-                    schema_version: 1,
-                    alert_id: alert_id(contract_id, &tx.hash, &rule.label()),
-                    label: label.to_string(),
-                    contract_id: contract_id.to_string(),
-                    network: network.to_string(),
-                    // #44: Use the single canonical implementations from txwatch-config.
-                    rule_type: rule.rule_type().to_string(),
-                    rule_triggered: rule.label(),
-                    transaction_hash: tx.hash.clone(),
-                    function_name: tx.function_names.first().cloned(),
-                    function_names: tx.function_names.clone(),
-                    function_args: tx.invocations.clone(),
-                    amount_xlm,
-                    amount_stroops: tx.amount_stroops,
-                    amount_xlm_decimal: amount_xlm_decimal.clone(),
-                    fee_charged_stroops: tx.fee_charged_stroops,
-                    source_account: tx.source_account.clone(),
-                    // Per-rule delivery overrides, absent unless the rule sets them.
-                    severity: entry.severity().map(|s| s.to_string()),
-                    effective_webhook_url: entry.webhook_url().map(str::to_owned),
-                    effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
-                    timestamp,
-                    timestamp_iso: timestamp_iso.clone(),
-                    horizon_link: horizon_link.clone(),
-                    explorer_link: explorer_link.clone(),
-                    ledger: tx.ledger,
-                    memo: tx.memo.clone(),
-                    memo_type: tx.memo_type.clone(),
-                    operation_count: tx.operation_count,
-                    resolved: false,
-                    matched_events: matched_events(rule, tx),
-                    suppressed_count: 0,
-                    observed_count: None,
-                    test: false,
-                    old_wasm_hash: upgrade_hashes(rule, tx).and_then(|(o, _)| o),
-                    new_wasm_hash: upgrade_hashes(rule, tx).and_then(|(_, n)| n),
-                    enrichment_incomplete: tx.enrichment_incomplete,
-                }),
+                Ok(true) => {
+                    let rule_type = rule.rule_type().to_string();
+                    let rule_triggered = rule.label();
+                    Some(AlertPayload {
+                        schema_version: 1,
+                        alert_id: alert_id(
+                            &ctx.network_id,
+                            contract_id,
+                            &tx.hash,
+                            &rule_type,
+                            &rule_triggered,
+                            rule_index,
+                        ),
+                        label: label.to_string(),
+                        contract_id: contract_id.to_string(),
+                        network: network.to_string(),
+                        // #44: Use the single canonical implementations from txwatch-config.
+                        rule_type,
+                        rule_triggered,
+                        transaction_hash: tx.hash.clone(),
+                        function_name: tx.function_names.first().cloned(),
+                        function_names: tx.function_names.clone(),
+                        function_args: tx.invocations.clone(),
+                        amount_xlm,
+                        amount_stroops: tx.amount_stroops,
+                        amount_xlm_decimal: amount_xlm_decimal.clone(),
+                        fee_charged_stroops: tx.fee_charged_stroops,
+                        source_account: tx.source_account.clone(),
+                        // Per-rule delivery overrides, absent unless the rule sets them.
+                        severity: entry.severity().map(|s| s.to_string()),
+                        effective_webhook_url: entry.webhook_url().map(str::to_owned),
+                        effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
+                        timestamp,
+                        timestamp_iso: timestamp_iso.clone(),
+                        horizon_link: horizon_link.clone(),
+                        explorer_link: explorer_link.clone(),
+                        ledger: tx.ledger,
+                        memo: tx.memo.clone(),
+                        memo_type: tx.memo_type.clone(),
+                        operation_count: tx.operation_count,
+                        resolved: false,
+                        matched_events: matched_events(rule, tx),
+                        suppressed_count: 0,
+                        observed_count: None,
+                        test: false,
+                        old_wasm_hash: upgrade_hashes(rule, tx).and_then(|(o, _)| o),
+                        new_wasm_hash: upgrade_hashes(rule, tx).and_then(|(_, n)| n),
+                        enrichment_incomplete: tx.enrichment_incomplete,
+                    })
+                }
                 Ok(false) => None,
                 Err(e) => {
                     // A broken rule would otherwise warn on every poll cycle.
@@ -1247,6 +1287,9 @@ pub enum NoActivityState {
 /// Check the `NoActivity` rule for a single contract after one poll cycle.
 ///
 /// * `rule`              — must be `AlertRule::NoActivity { minutes }`.
+/// * `rule_index`        — position of this rule in the contract's `rules`
+///   list, hashed into `alert_id` so two identical `NoActivity` rules on one
+///   contract get distinct IDs (#252).
 /// * `last_seen`         — the timestamp of the most recent transaction seen,
 ///   or `None` if we have never seen any transaction.
 /// * `now`               — current time (injectable for testing).
@@ -1264,6 +1307,7 @@ pub enum NoActivityState {
 /// - Activity present and never breached → returns `None`.
 pub fn check_no_activity(
     rule: &AlertRule,
+    rule_index: usize,
     last_seen: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     state: &mut NoActivityState,
@@ -1298,7 +1342,14 @@ pub fn check_no_activity(
         // Threshold just exceeded for the first time → fire incident.
         (NoActivityState::Active, true) => {
             let rule_triggered = format!("NoActivity({}min)", minutes);
-            let incident_id = alert_id(ctx.contract_id, &ts.to_string(), &rule_triggered);
+            let incident_id = alert_id(
+                &ctx.network_id,
+                ctx.contract_id,
+                &ts.to_string(),
+                "NoActivity",
+                &rule_triggered,
+                rule_index,
+            );
             *state = NoActivityState::Alerting {
                 incident_alert_id: incident_id.clone(),
             };
@@ -1345,9 +1396,12 @@ pub fn check_no_activity(
         (NoActivityState::Alerting { incident_alert_id }, false) => {
             let recovery_alert_id = if incident_alert_id.is_empty() {
                 alert_id(
+                    &ctx.network_id,
                     ctx.contract_id,
                     &ts.to_string(),
+                    "NoActivity",
                     &format!("NoActivity({}min) resolved", minutes),
+                    rule_index,
                 )
             } else {
                 incident_alert_id.clone()
@@ -1547,7 +1601,7 @@ impl CooldownTracker {
 
         let mut summaries = Vec::new();
 
-        for rule_cfg in rules {
+        for (rule_index, rule_cfg) in rules.iter().enumerate() {
             if !rule_cfg.cooldown_summary {
                 continue;
             }
@@ -1573,7 +1627,14 @@ impl CooldownTracker {
 
                     let ts = now.timestamp();
                     let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                    let alert_id = alert_id(ctx.contract_id, &ts.to_string(), &rule_trig);
+                    let alert_id = alert_id(
+                        &ctx.network_id,
+                        ctx.contract_id,
+                        &ts.to_string(),
+                        rule_cfg.rule.rule_type(),
+                        &rule_trig,
+                        rule_index,
+                    );
 
                     summaries.push(AlertPayload {
                         label: ctx.label.to_string(),
@@ -1825,6 +1886,7 @@ mod tests {
             label: "Label",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
@@ -1988,6 +2050,7 @@ mod tests {
             label: "L",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
@@ -2245,6 +2308,7 @@ mod tests {
                 label: "L",
                 contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
                 network: "testnet",
+                network_id: "testnet".into(),
                 horizon_base,
                 explorer_base,
             };
@@ -3088,6 +3152,7 @@ mod prop_tests {
             label: "PropTest",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
@@ -3167,6 +3232,7 @@ mod prop_tests {
                 label: "PropTest",
                 contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 network: "testnet",
+                network_id: "testnet".into(),
                 horizon_base: "https://horizon-testnet.stellar.org",
                 explorer_base: Some("https://stellar.expert/explorer/testnet"),
             };
@@ -3190,6 +3256,7 @@ mod no_activity_tests {
             label: "Oracle",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         }
@@ -3211,7 +3278,7 @@ mod no_activity_tests {
         // Last seen 6 minutes ago — threshold is 5 min, so this should fire.
         let last_seen = ts(12, 0);
         let now = ts(12, 6);
-        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+        let payload = check_no_activity(&rule, 0, Some(last_seen), now, &mut state, &eval_ctx);
 
         assert!(payload.is_some(), "should fire when quiet for > threshold");
         let p = payload.unwrap();
@@ -3239,7 +3306,7 @@ mod no_activity_tests {
         // Last seen 4 minutes ago — below threshold.
         let last_seen = ts(12, 0);
         let now = ts(12, 4);
-        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+        let payload = check_no_activity(&rule, 0, Some(last_seen), now, &mut state, &eval_ctx);
 
         assert!(payload.is_none());
         assert_eq!(state, NoActivityState::Active);
@@ -3255,7 +3322,7 @@ mod no_activity_tests {
         // Exactly 5 minutes gap — should fire.
         let last_seen = ts(12, 0);
         let now = ts(12, 5);
-        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+        let payload = check_no_activity(&rule, 0, Some(last_seen), now, &mut state, &eval_ctx);
 
         assert!(payload.is_some(), "should fire at exactly threshold");
     }
@@ -3272,7 +3339,7 @@ mod no_activity_tests {
         // Still quiet — already alerting, so no second payload.
         let last_seen = ts(12, 0);
         let now = ts(12, 20);
-        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+        let payload = check_no_activity(&rule, 0, Some(last_seen), now, &mut state, &eval_ctx);
 
         assert!(
             payload.is_none(),
@@ -3292,9 +3359,12 @@ mod no_activity_tests {
         let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let incident_id = alert_id(
+            &eval_ctx.network_id,
             eval_ctx.contract_id,
             &ts(12, 0).timestamp().to_string(),
+            "NoActivity",
             "NoActivity(5min)",
+            0,
         );
         let mut state = NoActivityState::Alerting {
             incident_alert_id: incident_id.clone(),
@@ -3303,7 +3373,7 @@ mod no_activity_tests {
         // Activity just happened (1 minute ago) while we were in Alerting state.
         let last_seen = ts(12, 10);
         let now = ts(12, 11);
-        let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
+        let payload = check_no_activity(&rule, 0, Some(last_seen), now, &mut state, &eval_ctx);
 
         assert!(
             payload.is_some(),
@@ -3330,7 +3400,7 @@ mod no_activity_tests {
         let last_seen_1 = ts(12, 0);
         let now_1 = ts(12, 6);
         let payload_1 =
-            check_no_activity(&rule, Some(last_seen_1), now_1, &mut state, &eval_ctx).unwrap();
+            check_no_activity(&rule, 0, Some(last_seen_1), now_1, &mut state, &eval_ctx).unwrap();
         assert!(!payload_1.resolved);
         let incident_id_1 = payload_1.alert_id.clone();
         assert_eq!(
@@ -3344,7 +3414,7 @@ mod no_activity_tests {
         let last_seen_2 = ts(12, 10);
         let now_2 = ts(12, 11);
         let recovery_1 =
-            check_no_activity(&rule, Some(last_seen_2), now_2, &mut state, &eval_ctx).unwrap();
+            check_no_activity(&rule, 0, Some(last_seen_2), now_2, &mut state, &eval_ctx).unwrap();
         assert!(recovery_1.resolved);
         assert_eq!(
             recovery_1.alert_id, incident_id_1,
@@ -3355,7 +3425,7 @@ mod no_activity_tests {
         // 3. Incident 2: quiet again at 12:20
         let now_3 = ts(12, 20);
         let payload_2 =
-            check_no_activity(&rule, Some(last_seen_2), now_3, &mut state, &eval_ctx).unwrap();
+            check_no_activity(&rule, 0, Some(last_seen_2), now_3, &mut state, &eval_ctx).unwrap();
         assert!(!payload_2.resolved);
         let incident_id_2 = payload_2.alert_id.clone();
         assert_eq!(
@@ -3375,7 +3445,7 @@ mod no_activity_tests {
         let last_seen_3 = ts(12, 25);
         let now_4 = ts(12, 26);
         let recovery_2 =
-            check_no_activity(&rule, Some(last_seen_3), now_4, &mut state, &eval_ctx).unwrap();
+            check_no_activity(&rule, 0, Some(last_seen_3), now_4, &mut state, &eval_ctx).unwrap();
         assert!(recovery_2.resolved);
         assert_eq!(
             recovery_2.alert_id, incident_id_2,
@@ -3393,7 +3463,7 @@ mod no_activity_tests {
 
         // No transactions ever seen — treated as infinite quiet period.
         let now = ts(12, 0);
-        let payload = check_no_activity(&rule, None, now, &mut state, &eval_ctx);
+        let payload = check_no_activity(&rule, 0, None, now, &mut state, &eval_ctx);
 
         assert!(
             payload.is_some(),
@@ -3453,13 +3523,84 @@ mod suppressor_tests {
 
     #[test]
     fn alert_id_is_deterministic_and_distinguishes_inputs() {
-        let id = alert_id("CA", "tx1", "AnyTransaction");
-        assert_eq!(id, alert_id("CA", "tx1", "AnyTransaction"));
+        let id = alert_id("testnet", "CA", "tx1", "AnyTransaction", "AnyTransaction", 0);
+        assert_eq!(
+            id,
+            alert_id("testnet", "CA", "tx1", "AnyTransaction", "AnyTransaction", 0)
+        );
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(id, alert_id("CA", "tx2", "AnyTransaction"));
-        assert_ne!(id, alert_id("CA", "tx1", "TransactionFailed"));
-        assert_ne!(alert_id("ab", "c", "r"), alert_id("a", "bc", "r"));
+        assert_ne!(id, alert_id("testnet", "CA", "tx2", "AnyTransaction", "AnyTransaction", 0));
+        assert_ne!(id, alert_id("testnet", "CA", "tx1", "TransactionFailed", "TransactionFailed", 0));
+        assert_ne!(id, alert_id("mainnet", "CA", "tx1", "AnyTransaction", "AnyTransaction", 0));
+        assert_ne!(id, alert_id("testnet", "CA", "tx1", "LargeTransfer", "AnyTransaction", 0));
+        assert_ne!(id, alert_id("testnet", "CA", "tx1", "AnyTransaction", "AnyTransaction", 1));
+        assert_ne!(
+            alert_id("testnet", "ab", "c", "r", "r", 0),
+            alert_id("testnet", "a", "bc", "r", "r", 0)
+        );
+    }
+
+    /// Two rules with identical labels on one contract (e.g. two
+    /// `LargeTransfer(>=100XLM)` rules routed to different webhooks) must get
+    /// distinct `alert_id`s, otherwise receivers deduplicate one of them away
+    /// (#252).
+    #[test]
+    fn identical_rules_on_one_contract_do_not_collide() {
+        let tx = EnrichedTransaction {
+            hash: "deadbeef".into(),
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            successful: true,
+            paging_token: "1".into(),
+            function_names: vec![],
+            amount_stroops: Some(500_000_000_000),
+            fee_charged_stroops: None,
+            source_account: None,
+            fee_account: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            watched_contract_id: "CAAA".into(),
+            events: vec![],
+            contract_transfers: vec![ContractTransfer {
+                from: "CAAA".into(),
+                to: "GBUYER".into(),
+                amount_stroops: 500_000_000_000,
+            }],
+            wasm_upgrade: None,
+            enrichment_incomplete: false,
+        };
+        let ctx = EvalContext {
+            label: "L",
+            contract_id: "CAAA",
+            network: "testnet",
+            network_id: "testnet".into(),
+            horizon_base: "https://h",
+            explorer_base: Some("https://e"),
+        };
+        let same_rule = || AlertRule::LargeTransfer {
+            threshold_xlm: 100,
+            direction: "any".into(),
+            threshold_stroops: 1_000_000_000,
+        };
+        let payloads = evaluate(&ctx, &[same_rule(), same_rule()], &tx, None);
+        assert_eq!(payloads.len(), 2, "both duplicate rules must fire");
+        assert_eq!(payloads[0].rule_triggered, payloads[1].rule_triggered);
+        assert_eq!(payloads[0].alert_id, alert_id(
+            "testnet", "CAAA", "deadbeef", "LargeTransfer",
+            &payloads[0].rule_triggered, 0,
+        ));
+        assert_ne!(
+            payloads[0].alert_id, payloads[1].alert_id,
+            "identical rules at different indexes must not share an alert_id"
+        );
+
+        // The same rule on a different network must not collide either.
+        let mut other = ctx.clone();
+        other.network_id = "mainnet".into();
+        let other_payloads = evaluate(&other, &[same_rule()], &tx, None);
+        assert_ne!(payloads[0].alert_id, other_payloads[0].alert_id);
     }
 
     #[test]
@@ -3489,6 +3630,7 @@ mod suppressor_tests {
             label: "L",
             contract_id: "CAAA",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://h",
             explorer_base: Some("https://e"),
         };
@@ -3501,7 +3643,14 @@ mod suppressor_tests {
         assert_eq!(payloads.len(), 2);
         assert_eq!(
             payloads[0].alert_id,
-            alert_id("CAAA", "deadbeef", "AnyTransaction")
+            alert_id(
+                "testnet",
+                "CAAA",
+                "deadbeef",
+                "AnyTransaction",
+                "AnyTransaction",
+                0,
+            )
         );
         assert_ne!(payloads[0].alert_id, payloads[1].alert_id);
     }
@@ -3634,6 +3783,7 @@ mod suppressor_tests {
             label: "Label",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
@@ -4091,6 +4241,7 @@ mod suppressor_tests {
             label: "Oracle",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             network: "testnet",
+            network_id: "testnet".into(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         }

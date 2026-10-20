@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
 - `SourceAccount`'s `allow`/`deny` fields are deprecated in favour of `mode` + `accounts`; both previously fired on list *membership*, which reversed the expected "alert on unknown caller" behaviour (#250).
 - `NoActivity` incidents now carry a unique `alert_id` per incident, and the recovery alert reuses its incident's `alert_id` so the two can be correlated (#254, #255).
+- `alert_id` now hashes the network cursor ID, the rule type, the rule label and the rule's index within its contract's `rules` list — previously it only hashed `contract_id`, `tx_hash` and `rule_triggered`, so two rules with identical labels on one contract (e.g. two `LargeTransfer(>=100XLM)` rules routed to different webhooks) produced the same ID and were deduplicated away by receivers (#252). **IDs change**: receivers that persist `alert_id` for deduplication will see new values for alerts generated after upgrading, so old entries can no longer be matched against new ones. `EvalContext` gains a `network_id` field and `check_no_activity` gains a `rule_index` parameter.
 
 ### Removed
 
