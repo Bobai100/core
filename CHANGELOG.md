@@ -9,17 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FunctionCalled` argument matching: `args = [{ index = 1, eq = "G…" }]` matches decoded invocation parameters (Address, Symbol, integer and String `ScVal`s); decoded invocations are included in the alert payload as `function_args` (#266).
+- `Rate { rule, count, window_seconds }` alert rule: fires when the wrapped rule matches at least `count` times within a sliding `window_seconds` window per contract, emitting one alert per breach with the observed count (#267).
+- `Memo { memo_type, equals | prefix }` alert rule: matches transaction memos by type and exact value or text prefix, with validation (#268).
 - `NoActivity { minutes }` alert rule: fires once when a contract goes quiet longer than the configured threshold, and again (with `resolved = true`) when activity resumes. Evaluated per poll cycle, not per transaction. Null transaction hash and synthetic Horizon/Explorer links are used for the alert payload (#62).
 - `EvalContext` struct replaces the five positional `&str` parameters of `evaluate()`, preventing argument-order bugs at compile time; `EvalContext::from_contract` derives all fields from a `WatchedContract` (#59).
 - `WarningSuppressor`: repeated rule evaluation errors for the same rule are logged on the first occurrence and every 100th recurrence thereafter, preventing log flooding from structurally broken rules (#60).
 - Property-based tests for `LargeTransfer` and `HighFee` rule thresholds using `proptest`, covering the full u64 range and verifying `evaluate` never panics (#61).
 - `resolved` field added to `AlertPayload` JSON (`false` for incident alerts, `true` for recovery alerts); docs/configuration.md and README updated accordingly.
+- CI now diffs the output of `txwatch schema` against the committed `docs/txwatch-config.schema.json`, so the committed schema can no longer drift from the code (#201).
+- CI runs `actionlint` over the workflows, catching duplicated or broken steps (#202).
+- CI test matrix now covers `ubuntu-latest`, `macos-latest` and `windows-latest`, including a Windows test that the cursor file is atomically replaced (#203).
+- `SourceAccount` gains an explicit `mode = "in" | "not_in"` with an `accounts` list, plus an `alert_unless` allowlist shorthand. `mode = "not_in"` never fires when the transaction has no source account, so it can safely express "alert on any unknown caller" (#250).
+- `cooldown_summary = true` on a rule emits a summary alert carrying the accumulated `suppressed_count` once the cooldown window expires, so matches suppressed at the end of a burst are reported (#259).
 
 ### Changed
 
 - `evaluate()` now accepts `&EvalContext` and an optional `&WarningSuppressor` instead of five positional string arguments and no suppressor (#59, #60).
 - `WatchedContract::collect_errors` and `AppConfig::validate` now collect all validation errors before returning instead of stopping at the first failure (#60).
 - Rule evaluation errors are rate-limited: only the first occurrence and every 100th recurrence are logged (#60).
+- `SourceAccount`'s `allow`/`deny` fields are deprecated in favour of `mode` + `accounts`; both previously fired on list *membership*, which reversed the expected "alert on unknown caller" behaviour (#250).
+- `NoActivity` incidents now carry a unique `alert_id` per incident, and the recovery alert reuses its incident's `alert_id` so the two can be correlated (#254, #255).
+
+### Removed
+
+- `PlanCache` (and its `txwatch-poller` re-export) removed as dead code: it cached results for a `GET /api/analytics/plan-statistics` endpoint that TxWatch does not have (#292).
+- **Breaking:** `YieldCalculator` and `PoolYield` are no longer exported from `txwatch-rules`. The module returned hard-coded "live" testnet data, ignored `pool_id`, and performed I/O in a crate documented as pure; it had no callers. Use a dedicated crate for live yield queries (#269).
 
 
 - `X-TxWatch-Version` header on every webhook request
@@ -38,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SIGHUP` reloads the config without restarting; cursors of remaining contracts are kept and an invalid file is ignored
 - Per-contract `poll_interval_seconds` override; each contract is polled on its own schedule and `txwatch validate` shows the effective interval
 - `EventEmitted` rule matching Soroban contract events by topic (symbol on topic 0, optional positional topics with `*` wildcard); events are fetched from Soroban RPC `getEvents` and included in the new `matched_events` payload field. New `soroban_rpc_url` contract setting and `rpc_url` custom-network setting
+- `batch_alerts` setting to coalesce alerts for the same contract into a single webhook delivery
 - Optional per-rule `cooldown_seconds`: matches of the same (contract, rule) inside the window are suppressed and reported in the new `suppressed_count` payload field of the next alert
 
 ### Changed
@@ -48,12 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `poll_interval_seconds` is bounded to 5–3600 seconds
 - `txwatch test-webhook` exits with code 1 when delivery fails
 - Config parse errors name the offending field path
-- Config validation reports every error at once instead of stopping at the first
+- Config validation reports every error at once instead of stopping at the first error
 - `--config` defaults to `./txwatch.toml` instead of `config/example.toml`, and a missing config file is an error
 - `poll_interval_seconds` defaults to 10 and is no longer required
 - `http_pool_max_idle_per_host` and `http_tcp_keepalive_secs` have concrete defaults (10 and 30) and are range-checked (1–100 and 0–7200); `http_tcp_keepalive_secs = 0` now disables keepalive as documented
 - Contract labels are trimmed, must not contain control characters, are limited to 128 characters, and are compared case-insensitively for duplicates
 - `FunctionCalled` / `AdminFunctionCalled` function names must be valid Soroban symbols (at most 32 characters from `[a-zA-Z0-9_]`)
+- The unused `soroban-xdr` feature and its `stellar-xdr` dependency were removed from `txwatch-rules`; no XDR decoding is implemented, so the previous "Soroban XDR decoding" claim was dropped (#204)
 
 ## [0.1.0] - 2025-01-01
 

@@ -1,6 +1,6 @@
 poll_interval_seconds = 10
 # Optional: how often the poller logs a periodic summary line, in seconds.
-# Set to 0 to disable the periodic summary entirely.
+# Set to 0 to disable the periodic summary entirely. Default: 60.
 # summary_interval_seconds = 60
 # Optional: maximum number of contracts polled concurrently in a single
 # `watch --once` run. Defaults to 10. Lower it if Horizon rate-limits you.
@@ -81,6 +81,48 @@ webhook_url = "https://hooks.example.com/vault-webhook"
   type          = "FunctionCalled"
   function_name = "withdraw"
 
+  # FunctionCalled with argument matching: alert only when `transfer` is called
+  # with `to` equal to the given address. Arguments are matched by position
+  # (index starts at 0) against the invocation parameters.
+  [[contracts.rules]]
+  type          = "FunctionCalled"
+  function_name = "transfer"
+  args = [
+    { index = 1, eq = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA" },
+  ]
+
+  # Rate rule: alert when the nested rule matches at least 3 times within a
+  # sliding 5-minute window. One alert is emitted per breach with the observed
+  # count.
+  [[contracts.rules]]
+  type           = "Rate"
+  count          = 3
+  window_seconds = 300
+    [contracts.rules.rule]
+    type = "TransactionFailed"
+
+  # Rate rule: alert when `withdraw` is called at least 50 times per hour
+  # (a typical exploit signal).
+  [[contracts.rules]]
+  type           = "Rate"
+  count          = 50
+  window_seconds = 3600
+    [contracts.rules.rule]
+    type          = "FunctionCalled"
+    function_name = "withdraw"
+
+  # Memo rule: alert on a specific memo ID or a memo text prefix. `memo_type`
+  # is optional; when omitted, any memo type is matched.
+  [[contracts.rules]]
+  type      = "Memo"
+  memo_type = "id"
+  equals    = "123456789"
+
+  [[contracts.rules]]
+  type      = "Memo"
+  memo_type = "text"
+  prefix    = "EXCHANGE-"
+
   # A composite rule with a disabled nested entry: the config is preserved but
   # the disabled rule is not evaluated.
   [[contracts.rules]]
@@ -114,10 +156,25 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
   [[contracts.rules]]
   type = "TransactionFailed"
 
-  # SourceAccount rule: alert when called by anyone except the known admin
+  # SourceAccount allowlist: alert when called by anyone except the known admin.
+  # mode = "not_in" fires when the caller is NOT in accounts, and never fires
+  # when the transaction has no source account.
   [[contracts.rules]]
   type = "All"
   [[contracts.rules.rules]]
+  type     = "SourceAccount"
+  mode     = "not_in"
+  accounts = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
+  # SourceAccount rule: alert when the known admin calls (deny fires when the
+  # source IS in the list). To alert when anyone EXCEPT the admin calls, use a
+  # Not rule wrapping a SourceAccount with allow = [...] instead.
+  #
+  #   allow = [addr]  →  fires when the source IS in the list
+  #   deny  = [addr]  →  fires when the source IS in the list (same direction!)
+  #
+  # Both fire on a match; the difference is which direction "match" means for
+  # your use-case. Use Not + allow to express "alert on everyone except X".
+  [[contracts.rules]]
   type  = "SourceAccount"
   deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
   severity = "warning"

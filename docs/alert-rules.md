@@ -124,11 +124,40 @@ direction     = "out"
 |-----------------|--------|----------|-----------|------------------------------------------|
 | `function_name` | string | yes      | —         | Pattern to match against the invoked function name |
 | `match`         | string | no       | `"exact"` | Matching mode: `"exact"`, `"prefix"`, or `"glob"` |
+| `args`          | [arg matcher] | no | unset   | Argument matchers; all must match (see below) |
 
 Matches when the Soroban `invoke_host_function` operation calls a function that satisfies the
 match condition. `"exact"` (the default) requires an identical name; `"prefix"` requires the
 invoked name to start with `function_name`; `"glob"` matches using `*` (any sequence) and `?`
 (exactly one character).
+
+#### Argument matching (`args`)
+
+Each entry in `args` matches one invocation parameter by position:
+
+| Field   | Type | Required | Description |
+|---------|------|----------|-------------|
+| `index` | u32  | yes      | Zero-based position in the operation's `parameters` array |
+| `eq`    | string | yes    | Value the decoded argument must equal exactly (max 128 characters, trimmed) |
+
+At most 16 matchers are allowed and each `index` may appear only once. All matchers must match
+the same invocation for the rule to fire. An argument that is missing does not match, and a rule
+with `args` never fires when the operation parameters could not be decoded.
+
+The following `ScVal` parameter types are decoded to text for comparison:
+
+| ScVal type | Decoded text |
+|------------|--------------|
+| `address`  | The G- or C-address string |
+| `symbol`   | The symbol text |
+| `u32`, `i32`, `u64`, `i64`, `u128`, `i128` | Decimal representation |
+| `bool`     | `true` / `false` |
+| `string`   | The string contents |
+
+Any other type is compared against its compact JSON rendering.
+
+When the rule fires, the decoded invocations are included in the payload as `function_args`
+(see [Webhook payload fields](#webhook-payload-fields)).
 
 ```toml
 # Exact match (default — backward compatible)
@@ -140,13 +169,84 @@ function_name = "withdraw"
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "admin_"
-match         = "prefix"
+match_mode    = "prefix"
 
 # Glob match: fires on set_fee, set_admin, set_pause, …
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "set_*"
 match         = "glob"
+
+# Argument match: transfer where the first argument is this address
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "transfer"
+args          = [{ index = 0, eq = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN" }]
+```
+
+### `Rate`
+
+| Field            | Type   | Required | Description |
+|------------------|--------|----------|-------------|
+| `rule`           | rule entry | yes  | The nested rule whose matches are counted |
+| `count`          | u32    | yes      | Number of matches that constitutes a breach (> 0) |
+| `window_seconds` | u64    | yes      | Length of the sliding window in seconds (> 0) |
+
+Fires when the nested `rule` matches at least `count` times within any `window_seconds`
+sliding window for the contract. This expresses rate-based conditions such as "more than 10
+failed transactions in 5 minutes" or "more than 50 `withdraw` calls per hour".
+
+One alert is emitted per breach, and the observed count is included in the payload as
+`observed_count`. The nested rule supports the same options as a top-level rule entry
+(`enabled`, `webhook_url`, `severity`, …). The breach clears the window, so the next alert
+needs another `count` matches. `count` may be at most 1,000,000 and `window_seconds` at most
+604,800 (one week).
+
+```toml
+# At least 10 failed transactions in 5 minutes
+[[contracts.rules]]
+type           = "Rate"
+count          = 10
+window_seconds = 300
+[contracts.rules.rule]
+type = "TransactionFailed"
+
+# At least 50 withdraw calls per hour
+[[contracts.rules]]
+type           = "Rate"
+count          = 50
+window_seconds = 3600
+[contracts.rules.rule]
+type          = "FunctionCalled"
+function_name = "withdraw"
+```
+
+### `Memo`
+
+| Field       | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `memo_type` | string | no       | Memo type to match: `"none"`, `"text"`, `"id"`, `"hash"`, or `"return"`. Omit to match any type |
+| `equals`    | string | one of the two | Exact memo value to match |
+| `prefix`    | string | one of the two | Memo value prefix to match |
+
+Set exactly one of `equals` or `prefix`; setting both is a validation error. Matches when the
+transaction has a memo whose content equals `equals` (or starts with `prefix`) and, when
+`memo_type` is set, whose memo type equals it.
+
+**Use case:** exchanges and bridges alerting on specific memo IDs or text prefixes.
+
+```toml
+# Alert on a specific deposit memo ID
+[[contracts.rules]]
+type      = "Memo"
+memo_type = "id"
+equals    = "123456789"
+
+# Alert on any memo text starting with a known prefix
+[[contracts.rules]]
+type      = "Memo"
+memo_type = "text"
+prefix    = "DEPOSIT-"
 ```
 
 ### `AdminFunctionCalled`
@@ -193,29 +293,33 @@ threshold_xlm = 1
 
 ### `SourceAccount`
 
-| Field   | Type       | Required | Description |
-|---------|------------|----------|-------------|
-| `allow` | [G-address] | no      | If set, only fire when the transaction source account is one of these addresses. |
-| `deny`  | [G-address] | no      | If set, fire when the transaction source account is one of these addresses. |
+| Field          | Type         | Required | Description |
+|----------------|--------------|----------|-------------|
+| `mode`         | string       | no       | `"in"` (default) to fire when source is in `accounts`; `"not_in"` to fire when source is not in `accounts`. |
+| `accounts`     | [G-address]  | no       | List of Stellar G-addresses to match against. |
+| `alert_unless` | [G-address]  | no       | Convenience alias: sets `accounts` and defaults `mode` to `"not_in"`. |
+| `allow`        | [G-address]  | no       | *(Deprecated)* Legacy membership list. Use `mode = "in"` with `accounts`. |
+| `deny`         | [G-address]  | no       | *(Deprecated)* Legacy membership list. Use `mode = "not_in"` with `accounts`. |
 
-At least one of `allow` or `deny` must be non-empty. Each address must be a valid 56-character Stellar G-address.
-
-Matches when the transaction `source_account` satisfies both:
-- It is in `allow` (if `allow` is non-empty), **and**
-- It is not in `deny` (if `deny` is non-empty).
-
-**Use case:** alert when an admin function is called by an unexpected account, or watch a specific counterparty.
+> **Migration Note:** The legacy `allow` and `deny` fields are deprecated. Previously, both `allow` and `deny` fired on membership, which was counter-intuitive for users wanting to alert on unknown callers. To alert when the caller is *not* on an allowlist, use `mode = "not_in"` with `accounts = [...]` (or `alert_unless = [...]`). This also prevents false alerts on missing transaction source accounts.
 
 ```toml
-# Fire only when called by the known multisig
+# Alert on any caller EXCEPT the approved admin (allowlist use case)
 [[contracts.rules]]
-type  = "SourceAccount"
-allow = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+type     = "SourceAccount"
+mode     = "not_in"
+accounts = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
 
-# Fire when called by any account except the approved bot
+# Or equivalently using alert_unless:
 [[contracts.rules]]
-type = "SourceAccount"
-deny = ["GBUKOFF2GVFNQRJFGHVGON2JKGB4VBUF2QQJFNJ6HQVTJRZTCGQX7ZR"]
+type         = "SourceAccount"
+alert_unless = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
+
+# Alert only when called by a specific known account
+[[contracts.rules]]
+type     = "SourceAccount"
+mode     = "in"
+accounts = ["GBUKOFF2GVFNQRJFGHVGON2JKGB4VBUF2QQJFNJ6HQVTJRZTCGQX7ZRA"]
 ```
 
 The `source_account` field is included in the alert payload when this rule fires (and whenever `source_account` is present in the Horizon response).
@@ -440,6 +544,8 @@ All matching enabled rules fire; there is no short-circuit.
 | `memo`               | string/null | no             | Memo content (absent for `MemoNone`)     |
 | `memo_type`          | string/null | no             | Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"` |
 | `operation_count`    | u32/null    | no             | Total operations in the transaction      |
+| `arguments`          | [string]    | no             | Decoded invocation arguments (see `FunctionCalled` `args`); present when the rule matched on arguments |
+| `observed_count`     | u32/null    | no             | Number of matches observed in the window for a `Rate` rule |
 | Field              | Type        | Always present | Description                              |
 |--------------------|-------------|----------------|------------------------------------------|
 | `label`            | string      | yes            | Contract label from config               |
@@ -510,6 +616,8 @@ The webhook payload includes two rule-related fields:
 | `Not` | `"Not"` |
 | `EventEmitted` | `"EventEmitted"` |
 | `ContractUpgraded` | `"ContractUpgraded"` |
+| `Rate` | `"Rate"` |
+| `Memo` | `"Memo"` |
 
 ## Adding a new rule type
 

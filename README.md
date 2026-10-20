@@ -199,8 +199,9 @@ webhook_url = "https://hooks.example.com/my-webhook"
   enabled = false
 
   [[contracts.rules]]
-  type  = "SourceAccount"
-  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+  type     = "SourceAccount"
+  mode     = "not_in"
+  accounts = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
 
   [[contracts.rules]]
   type = "All"
@@ -225,7 +226,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 | `AdminFunctionCalled` | Any function in a named list is invoked |
 | `HighFee` | Transaction fee is greater than or equal to `threshold_stroops` (or `threshold_xlm`) |
 | `EventEmitted` | The transaction emitted a contract event whose first topic is a given symbol |
-| `SourceAccount` | Transaction source account matches an allow/deny list |
+| `SourceAccount` | Transaction source account is in (or not in) a list of accounts |
 | `All` | All nested rules match (logical AND) |
 | `Any` | Any nested rule matches (logical OR) |
 | `Not` | Nested rule does not match (logical NOT) |
@@ -278,7 +279,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
 - `X-TxWatch-Alert-Id: <alert_id>` (same value as the `alert_id` body field — usable for deduplication without parsing the body)
-- `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
+- `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body; see [Verifying webhook signatures](docs/verifying-webhooks.md))
 - `X-TxWatch-Secret: <webhook_secret>` (optional, only when `webhook_secret` is configured — the raw secret; verify the signature instead where possible)
 - Any custom headers from `webhook_headers` (e.g. `Authorization: Bearer ${TOKEN}`)
 
@@ -476,3 +477,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 - #285: Contract Events Cost One `getEvents` Call per Ledger
 <!-- handsoff-issue-287 -->
 - #287: A Debug Log Message Contains a Long Run of Embedded Spaces
+<!-- handsoff-issue-290 -->
+- #290: `SorobanEventStreamer` "Stream" Mode Calls a Non-Existent Endpoint and Hangs
