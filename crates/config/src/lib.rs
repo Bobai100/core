@@ -237,6 +237,18 @@ impl Network {
             Network::Custom(custom) => custom.explorer_url.as_deref(),
         }
     }
+
+    /// The expected Horizon `network_passphrase` for this network, or `None`
+    /// when no passphrase is configured (custom networks without a passphrase
+    /// field skip the check).
+    pub fn expected_passphrase(&self) -> Option<&str> {
+        match self {
+            Network::Mainnet => Some("Public Global Stellar Network ; September 2015"),
+            Network::Testnet => Some("Test SDF Network ; September 2015"),
+            Network::Futurenet => Some("Test SDF Future Network ; version 1"),
+            Network::Custom(custom) => custom.passphrase.as_deref(),
+        }
+    }
 }
 
 impl fmt::Display for Network {

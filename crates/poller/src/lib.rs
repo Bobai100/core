@@ -1813,6 +1813,20 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     Ok((tx_count, alert_count, webhook_failures, skipped))
 }
 
+/// Deliver a single `AlertPayload` to the contract's webhook, applying the
+/// same rule-level URL/secret routing and destination filtering that the live
+/// watch path uses. Returns the number of destinations that could not be
+/// reached. This is the public entry point used by `txwatch replay --send`.
+pub async fn deliver_alert(
+    client: &Client,
+    contract: &WatchedContract,
+    payload: &txwatch_rules::AlertPayload,
+) -> u64 {
+    let mut failures = 0u64;
+    deliver_payload(client, contract, payload, false, &mut failures).await;
+    failures
+}
+
 /// Deliver a single `AlertPayload` to the contract's webhook, counting any
 /// failures into `webhook_failures`.
 async fn deliver_payload(

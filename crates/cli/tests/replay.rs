@@ -9,7 +9,8 @@ use tokio::process::Command;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const TX_HASH: &str = "replay001";
+// A valid 64-character hex transaction hash used by the happy-path tests.
+const TX_HASH: &str = "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
 
 fn write_config(name: &str, webhook_url: &str) -> PathBuf {
     let path = env::temp_dir().join(format!("txwatch_replay_{name}.toml"));
@@ -29,6 +30,33 @@ webhook_url = "{webhook_url}"
 
   [[contracts.rules]]
   type = "TransactionFailed"
+"#
+    );
+    fs::write(&path, config).unwrap();
+    path
+}
+
+/// Config with a per-rule webhook URL override for testing #223.
+fn write_config_with_rule_override(
+    name: &str,
+    default_url: &str,
+    rule_override_url: &str,
+) -> PathBuf {
+    let path = env::temp_dir().join(format!("txwatch_replay_{name}.toml"));
+    let config = format!(
+        r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Replay Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "{default_url}"
+
+  [[contracts.rules]]
+  type           = "AdminFunctionCalled"
+  function_names = ["set_admin"]
+  webhook_url    = "{rule_override_url}"
 "#
     );
     fs::write(&path, config).unwrap();
@@ -105,7 +133,7 @@ async fn replay_prints_matched_rules_without_sending() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("1 rule(s) matched transaction replay001"),
+        stdout.contains(&format!("1 rule(s) matched transaction {}", TX_HASH)),
         "{stdout}"
     );
     assert!(
@@ -152,4 +180,184 @@ async fn replay_unknown_transaction_exits_one() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("not found"));
+}
+
+// ── #222: hash validation tests ───────────────────────────────────────────────
+
+/// Helper: run replay with a custom --tx value and no horizon override.
+async fn replay_with_hash(hash: &str) -> std::process::Output {
+    // No real Horizon needed — validation happens before the HTTP call.
+    let config_path = env::temp_dir().join("txwatch_replay_hashtest.toml");
+    fs::write(
+        &config_path,
+        r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Hash Test"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/unused"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#,
+    )
+    .unwrap();
+
+    Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "replay",
+            "--contract",
+            "Hash Test",
+            "--tx",
+            hash,
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch")
+}
+
+#[tokio::test]
+async fn replay_rejects_hash_too_short() {
+    let output = replay_with_hash("abc123").await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid transaction hash"),
+        "expected hash validation error, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn replay_rejects_hash_too_long() {
+    // 65 hex characters — one too many
+    let output = replay_with_hash("aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdde").await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid transaction hash"),
+        "expected hash validation error, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn replay_rejects_hash_with_whitespace() {
+    let output = replay_with_hash("aabbccdd aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd").await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid transaction hash"),
+        "expected hash validation error, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn replay_rejects_hash_with_slash() {
+    let output = replay_with_hash("aabbccddaabbccddaabbccddaabbccdd/aabbccddaabbccddaabbccddaabbccdd").await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid transaction hash"),
+        "expected hash validation error, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn replay_accepts_hash_with_0x_prefix() {
+    // The 0x prefix should be stripped before use; the test just checks that
+    // validation passes (Horizon 404 → exit 1 with "not found", not "invalid hash").
+    let hash_with_prefix = format!("0x{}", TX_HASH);
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&horizon)
+        .await;
+
+    let config = write_config("0x_prefix", "https://hooks.example.com/unused");
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--horizon-url",
+            &horizon.uri(),
+            "replay",
+            "--contract",
+            "Replay Contract",
+            "--tx",
+            &hash_with_prefix,
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    // Should fail with "not found" (Horizon 404), not "invalid transaction hash"
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr.contains("not found"),
+        "expected 'not found', got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid transaction hash"),
+        "0x prefix should be accepted: {stderr}"
+    );
+}
+
+// ── #223: per-rule URL routing test ──────────────────────────────────────────
+
+#[tokio::test]
+async fn replay_send_routes_to_per_rule_webhook_url() {
+    // Verify that replay --send honours a rule-level `webhook_url` override,
+    // matching the live watch path's deliver_alert routing.
+    let horizon = horizon_with_admin_call().await;
+
+    let default_receiver = MockServer::start().await;
+    let rule_receiver = MockServer::start().await;
+
+    // The default webhook must NOT receive anything — the rule overrides it.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&default_receiver)
+        .await;
+
+    // The rule-level webhook must receive exactly one POST.
+    Mock::given(method("POST"))
+        .and(path("/rule-hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&rule_receiver)
+        .await;
+
+    let config = write_config_with_rule_override(
+        "rule_routing",
+        &format!("{}/default-hook", default_receiver.uri()),
+        &format!("{}/rule-hook", rule_receiver.uri()),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--horizon-url",
+            &horizon.uri(),
+            "replay",
+            "--contract",
+            "Replay Contract",
+            "--tx",
+            TX_HASH,
+            "--send",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
