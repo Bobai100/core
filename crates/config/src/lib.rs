@@ -346,6 +346,24 @@ pub enum SourceAccountMode {
     NotIn,
 }
 
+/// Which transaction account a `SourceAccount` rule matches against.
+///
+/// Horizon reports the account that signed the inner transaction in
+/// `source_account` and the account that paid the fee in `fee_account`.
+/// For regular transactions the two are equal; for fee-bump transactions
+/// `fee_account` is the fee-bump (outer) source account — the account
+/// that actually paid for the transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAccountField {
+    /// Match `source_account` (the inner source account). Default.
+    #[default]
+    Source,
+    /// Match `fee_account` (the fee payer; the fee-bump source account
+    /// for fee-bump transactions).
+    FeeAccount,
+}
+
 fn default_transfer_direction() -> String {
     "any".to_string()
 }
@@ -437,6 +455,12 @@ pub enum AlertRule {
         #[serde(default)]
         #[schemars(default)]
         mode: SourceAccountMode,
+        /// Which account to match: `"source"` (the inner source account,
+        /// the default) or `"fee_account"` (the fee payer — the fee-bump
+        /// source account for fee-bump transactions).
+        #[serde(default)]
+        #[schemars(default)]
+        field: SourceAccountField,
         #[serde(default, alias = "addresses")]
         accounts: Vec<String>,
         #[serde(default)]
@@ -573,6 +597,8 @@ enum AlertRuleRepr {
     SourceAccount {
         #[serde(default)]
         mode: SourceAccountMode,
+        #[serde(default)]
+        field: SourceAccountField,
         #[serde(default, alias = "addresses")]
         accounts: Vec<String>,
         #[serde(default)]
@@ -672,12 +698,14 @@ impl<'de> Deserialize<'de> for AlertRule {
             },
             AlertRuleRepr::SourceAccount {
                 mode,
+                field,
                 accounts,
                 alert_unless,
                 allow,
                 deny,
             } => AlertRule::SourceAccount {
                 mode,
+                field,
                 accounts,
                 alert_unless,
                 allow,
@@ -903,6 +931,7 @@ impl AlertRule {
             },
             AlertRule::SourceAccount {
                 mode,
+                field: _,
                 accounts,
                 alert_unless,
                 allow,
@@ -1172,6 +1201,12 @@ impl AlertRule {
                 allow,
                 deny,
             } => {
+                // Only mention `field` when it is non-default so existing
+                // alert IDs (derived from the label) stay stable.
+                let field_str = match field {
+                    SourceAccountField::Source => "",
+                    SourceAccountField::FeeAccount => "field=fee_account, ",
+                };
                 let list = if !accounts.is_empty() {
                     accounts
                 } else if !alert_unless.is_empty() {
@@ -1184,7 +1219,12 @@ impl AlertRule {
                         SourceAccountMode::In => "in",
                         SourceAccountMode::NotIn => "not_in",
                     };
-                    format!("SourceAccount({}: [{}])", mode_str, list.join(", "))
+                    format!(
+                        "SourceAccount({}{}: [{}])",
+                        field_str,
+                        mode_str,
+                        list.join(", ")
+                    )
                 } else {
                     let mut parts = Vec::new();
                     if !allow.is_empty() {
@@ -1193,7 +1233,7 @@ impl AlertRule {
                     if !deny.is_empty() {
                         parts.push(format!("deny=[{}]", deny.join(", ")));
                     }
-                    format!("SourceAccount({})", parts.join(", "))
+                    format!("SourceAccount({}{})", field_str, parts.join(", "))
                 }
             }
             AlertRule::All { rules } => {
@@ -4421,6 +4461,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
             mode: SourceAccountMode::In,
+            field: SourceAccountField::Source,
             accounts: vec![],
             alert_unless: vec![],
             allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
@@ -4434,6 +4475,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
             mode: SourceAccountMode::In,
+            field: SourceAccountField::Source,
             accounts: vec![],
             alert_unless: vec![],
             allow: vec![],
@@ -4447,6 +4489,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
             mode: SourceAccountMode::In,
+            field: SourceAccountField::Source,
             accounts: vec![],
             alert_unless: vec![],
             allow: vec![],
@@ -4465,6 +4508,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
             mode: SourceAccountMode::In,
+            field: SourceAccountField::Source,
             accounts: vec![],
             alert_unless: vec![],
             allow: vec!["NOT_A_STELLAR_ADDR".into()],
