@@ -576,9 +576,16 @@ All matching enabled rules fire; there is no short-circuit.
 
 ### `alert_id` and deduplication
 
-`alert_id` is derived deterministically from `(network, contract_id, tx_hash, rule_type, rule_triggered)`
-via SHA-256 (first 16 bytes → 32 hex chars). The same alert always produces the same `alert_id`,
-so receivers can safely deduplicate retries and cursor replays by storing and checking this value.
+`alert_id` is derived deterministically from
+`(network cursor ID, contract_id, tx_hash, rule_type, rule_triggered, rule_index)` via SHA-256
+(first 16 bytes → 32 hex chars), where `rule_index` is the rule's position in its contract's
+`rules` list. The same alert always produces the same `alert_id`, so receivers can safely
+deduplicate retries and cursor replays by storing and checking this value.
+
+Because the network and the rule identity (type, label and index) are part of the hash, two rules
+with identical labels on one contract — e.g. two `LargeTransfer(>=100XLM)` rules routed to
+different webhooks — never collapse into the same `alert_id` (#252).
+
 It is also sent as the `X-TxWatch-Alert-Id` request header, enabling deduplication without parsing
 the JSON body.
 

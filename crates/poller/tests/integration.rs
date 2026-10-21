@@ -272,6 +272,7 @@ async fn any_transaction_fires_webhook() {
             label: &contract.label,
             contract_id: &contract.contract_id,
             network: contract.network.as_str(),
+            network_id: contract.network.cursor_id(),
             horizon_base: &horizon.uri(),
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
@@ -377,6 +378,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             label: &contract.label,
             contract_id: &contract.contract_id,
             network: contract.network.as_str(),
+            network_id: contract.network.cursor_id(),
             horizon_base: &horizon.uri(),
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
@@ -439,6 +441,7 @@ async fn large_transfer_fires_above_threshold() {
             label: &contract.label,
             contract_id: &contract.contract_id,
             network: contract.network.as_str(),
+            network_id: contract.network.cursor_id(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         },
@@ -527,6 +530,7 @@ async fn function_called_rule_fires_on_exact_match() {
                 label: &contract.label,
                 contract_id: &contract.contract_id,
                 network: contract.network.as_str(),
+                network_id: contract.network.cursor_id(),
                 horizon_base: "https://horizon-testnet.stellar.org",
                 explorer_base: Some("https://stellar.expert/explorer/testnet"),
             },
@@ -737,6 +741,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
             label: &contract.label,
             contract_id: &contract.contract_id,
             network: contract.network.as_str(),
+            network_id: contract.network.cursor_id(),
             horizon_base: &horizon.uri(),
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         },
@@ -1757,6 +1762,7 @@ async fn large_transfer_only_counts_transfers_involving_the_contract() {
         label: &contract.label,
         contract_id: &contract.contract_id,
         network: contract.network.as_str(),
+        network_id: contract.network.cursor_id(),
         horizon_base: "https://horizon-testnet.stellar.org",
         explorer_base: Some("https://stellar.expert/explorer/testnet"),
     };
@@ -1834,6 +1840,7 @@ async fn large_transfer_respects_direction_option() {
         label: &contract.label,
         contract_id: &contract.contract_id,
         network: contract.network.as_str(),
+        network_id: contract.network.cursor_id(),
         horizon_base: "https://horizon-testnet.stellar.org",
         explorer_base: Some("https://stellar.expert/explorer/testnet"),
     };
@@ -1907,6 +1914,7 @@ async fn contract_upgraded_rule_fires_with_wasm_hashes() {
             label: &contract.label,
             contract_id: &contract.contract_id,
             network: contract.network.as_str(),
+            network_id: contract.network.cursor_id(),
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
         },

@@ -33,6 +33,7 @@ fn test_ctx() -> EvalContext<'static> {
         label: "Escrow",
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         network: "testnet",
+        network_id: "testnet".into(),
         horizon_base: "https://horizon-testnet.stellar.org",
         explorer_base: Some("https://stellar.expert/explorer/testnet"),
     }

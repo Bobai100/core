@@ -758,12 +758,12 @@ changes before parsing other fields.
 
 - `schema_version` — integer version of this payload shape. Use this to detect breaking changes.
 - `alert_id` — stable, deterministic identifier (32 hex chars) derived from
-  `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256. Identical for every
-  retry of the same alert. Receivers should deduplicate on this value. Also sent as the
-  `X-TxWatch-Alert-Id` request header for deduplication without parsing the body.
-- `alert_id` — stable 32-character hex ID derived from the contract, transaction and rule; the same
-  alert always has the same ID, so receivers can de-duplicate redeliveries. PagerDuty uses it as the
-  `dedup_key`.
+  `(network cursor ID, contract_id, tx_hash, rule_type, rule_triggered, rule_index)` via SHA-256,
+  where `rule_index` is the rule's position in its contract's `rules` list. Identical for every
+  retry of the same alert, but distinct for every rule — two rules with identical labels on one
+  contract never share an ID (#252). Receivers should deduplicate on this value; PagerDuty uses it
+  as the `dedup_key`. Also sent as the `X-TxWatch-Alert-Id` request header for deduplication
+  without parsing the body.
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`); use it for routing.
 - `rule_triggered` — human-readable rule description including parameters.
 - `amount_xlm` — whole-XLM transfer amount (truncated integer), or `null` when the transaction has none. Kept for backward compatibility — use `amount_xlm_decimal` for precise accounting.

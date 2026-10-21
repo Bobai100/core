@@ -67,6 +67,7 @@ fn bench_evaluate(c: &mut Criterion) {
         label: "bench",
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
         network: "testnet",
+        network_id: "testnet".into(),
         horizon_base: "https://horizon-testnet.stellar.org",
         explorer_base: Some("https://stellar.expert/explorer/testnet"),
     };
