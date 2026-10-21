@@ -1101,15 +1101,17 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         }
 
         AlertRule::All { rules } => {
+            let mut has_enabled_rule = false;
             for entry in rules {
                 if !entry.enabled {
                     continue;
                 }
+                has_enabled_rule = true;
                 if !eval_rule(&entry.rule, tx)? {
                     return Ok(false);
                 }
             }
-            true
+            has_enabled_rule
         }
 
         AlertRule::Any { rules } => {
@@ -2761,6 +2763,26 @@ mod tests {
     }
 
     #[test]
+    fn all_rule_does_not_fire_when_all_subrules_are_disabled() {
+        let tx = make_tx(true, &[], None);
+        let all_rule = AlertRule::All {
+            rules: vec![RuleEntry {
+                enabled: false,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+                rule: AlertRule::AnyTransaction,
+            }],
+        };
+
+        let payloads = run(&[entry(all_rule)], &tx);
+        assert!(
+            payloads.is_empty(),
+            "All must not match when it has no enabled sub-rules"
+        );
+    }
+
+    #[test]
     fn any_rule_fires_when_one_condition_matches() {
         let tx = make_tx(true, &["upgrade"], None);
         let any_rule = AlertRule::Any {
@@ -2792,6 +2814,26 @@ mod tests {
         let payloads = run(&[entry(any_rule)], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].rule_type, "Any");
+    }
+
+    #[test]
+    fn any_rule_does_not_fire_when_all_subrules_are_disabled() {
+        let tx = make_tx(true, &[], None);
+        let any_rule = AlertRule::Any {
+            rules: vec![RuleEntry {
+                enabled: false,
+                webhook_url: None,
+                webhook_secret: None,
+                severity: None,
+                rule: AlertRule::AnyTransaction,
+            }],
+        };
+
+        let payloads = run(&[entry(any_rule)], &tx);
+        assert!(
+            payloads.is_empty(),
+            "Any must not match when it has no enabled sub-rules"
+        );
     }
 
     #[test]
