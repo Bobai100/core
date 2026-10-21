@@ -1535,6 +1535,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         label: &contract.label,
         contract_id: &contract.contract_id,
         network: contract.network.as_str(),
+        network_id: contract.network.cursor_id(),
         horizon_base: canonical_base,
         explorer_base: contract.network.explorer_base_url(),
     };
@@ -1779,6 +1780,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
         }
         if let Some(payload) = check_no_activity(
             &rule.rule,
+            idx,
             state.last_seen,
             now,
             &mut state.no_activity_states[idx],
@@ -1865,6 +1867,20 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     }
 
     Ok((tx_count, alert_count, webhook_failures, skipped))
+}
+
+/// Deliver a single `AlertPayload` to the contract's webhook, applying the
+/// same rule-level URL/secret routing and destination filtering that the live
+/// watch path uses. Returns the number of destinations that could not be
+/// reached. This is the public entry point used by `txwatch replay --send`.
+pub async fn deliver_alert(
+    client: &Client,
+    contract: &WatchedContract,
+    payload: &txwatch_rules::AlertPayload,
+) -> u64 {
+    let mut failures = 0u64;
+    deliver_payload(client, contract, payload, false, &mut failures).await;
+    failures
 }
 
 /// Deliver a single `AlertPayload` to the contract's webhook, counting any
@@ -2061,6 +2077,7 @@ fn evaluate_contract(
         label: &contract.label,
         contract_id: &contract.contract_id,
         network: contract.network.as_str(),
+        network_id: contract.network.cursor_id(),
         horizon_base,
         explorer_base: contract.network.explorer_base_url(),
     };

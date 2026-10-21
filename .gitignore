@@ -1,5 +1,23 @@
 /target
 Cargo.lock
+
+# Test snapshot files (e.g. from insta or similar snapshot-testing crates)
+**/*.snap
+**/*.snap.new
+**/snapshots/
+
+# Temporary files written during tests
+*.tmp
+*.toml.bak
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/settings.json
 vrickish.md
 
 # Test snapshots (e.g. insta, trycmd)

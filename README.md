@@ -291,7 +291,7 @@ service. See [Multiple destinations](docs/configuration.md#multiple-destinations
 
 **Fields:**
 - `schema_version` — integer version of this payload shape (currently `1`). Additive changes (new optional fields) keep the same version; breaking changes (field removals or renames) bump it. Receivers should use this to detect incompatible changes.
-- `alert_id` — stable, deterministic identifier derived from `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256 prefix (32 hex chars). Identical for every retry of the same alert. Receivers should deduplicate on this value.
+- `alert_id` — stable, deterministic identifier derived from `(network, contract_id, tx_hash, rule_type, rule_triggered, rule_index)` via SHA-256 prefix (32 hex chars), where `network` is the network cursor ID (e.g. `custom@https://…` for custom networks) and `rule_index` is the rule's position in the contract's `rules` list. Identical for every retry of the same alert, but never shared between two rules — even two rules with identical labels get different IDs (#252). Receivers should deduplicate on this value.
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
