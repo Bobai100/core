@@ -494,7 +494,9 @@ async fn main() -> Result<()> {
                 for (label, url, result) in checks {
                     match result {
                         Ok(status) => {
-                            if status == "method not allowed" {
+                            // Any "HTTP NNN" result means a non-success, non-auth response — treat as failure.
+                            let is_failure = status.starts_with("HTTP ");
+                            if is_failure {
                                 failed = true;
                             }
                             println!("  {:<18} {:<20} {}", label, status, url)
@@ -524,7 +526,7 @@ async fn main() -> Result<()> {
                 println!("Horizon checks:");
                 for check in checks {
                     println!(
-                        "  {:<10} {:<12} latest ledger: {} — {}",
+                        "  {:<10} {:<20} latest ledger: {} — {}",
                         check.network,
                         check.status,
                         check
@@ -532,7 +534,7 @@ async fn main() -> Result<()> {
                             .map_or_else(|| "unknown".into(), |n| n.to_string()),
                         check.message
                     );
-                    failed |= !check.reachable || !check.found;
+                    failed |= !check.reachable || !check.found || !check.passphrase_ok;
                 }
                 if failed {
                     return Err(anyhow::anyhow!("one or more Horizon checks failed"));
@@ -765,10 +767,14 @@ async fn main() -> Result<()> {
             send,
             force,
         } => {
+            // #222: validate and normalise the transaction hash before use.
+            let tx = validate_tx_hash(tx)?;
+
             let cfg = load_config(&cli)?;
             let contract = find_contract_by_label(&cfg, contract)?;
             let client = build_client().context("failed to build HTTP client")?;
 
+            let payloads = txwatch_poller::replay_transaction(&client, &contract, &tx).await?;
             let payloads =
                 txwatch_poller::replay_transaction(&client, &contract, tx, force).await?;
             println!(
@@ -784,24 +790,11 @@ async fn main() -> Result<()> {
             }
 
             if send {
-                let destinations = contract.destinations();
-                let mut failed = 0;
+                // #223: use the poller's deliver_alert so that rule-level URL/secret
+                // routing and destination filtering match the live watch path exactly.
+                let mut failed = 0u64;
                 for payload in &payloads {
-                    for destination in &destinations {
-                        match send_to_destination_simple(&client, destination, payload).await {
-                            Ok(result) => println!(
-                                "Delivered '{}' to {} (status {})",
-                                payload.rule_triggered, destination.url, result.final_status
-                            ),
-                            Err(e) => {
-                                failed += 1;
-                                eprintln!(
-                                    "webhook for rule '{}' to '{}' failed: {:#}",
-                                    payload.rule_triggered, destination.url, e
-                                );
-                            }
-                        }
-                    }
+                    failed += txwatch_poller::deliver_alert(&client, &contract, payload).await;
                 }
                 if failed > 0 {
                     return Err(anyhow::anyhow!("{} webhook delivery(ies) failed", failed));
@@ -1600,6 +1593,29 @@ fn parse_webhook_format(value: &str) -> Result<WebhookFormat, String> {
     })
 }
 
+/// Validate and normalise a transaction hash for use in Horizon URLs.
+///
+/// Accepts exactly 64 hexadecimal characters (case-insensitive) with an
+/// optional `0x` prefix, which is stripped. Returns an error for anything
+/// else so that whitespace, slashes and other junk never reach the URL.
+fn validate_tx_hash(raw: &str) -> Result<String> {
+    let hash = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if hash.len() != 64 {
+        anyhow::bail!(
+            "invalid transaction hash {:?}: expected 64 hex characters (got {})",
+            raw,
+            hash.len()
+        );
+    }
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "invalid transaction hash {:?}: must contain only hex characters [0-9a-fA-F]",
+            raw
+        );
+    }
+    Ok(hash.to_lowercase())
+}
+
 /// Parses repeated `--header "Name: value"` arguments.
 fn parse_headers(raw: &[String]) -> Result<WebhookHeaders> {
     let mut headers = WebhookHeaders::default();
@@ -1625,28 +1641,33 @@ fn parse_headers(raw: &[String]) -> Result<WebhookHeaders> {
     Ok(headers)
 }
 
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<&'static str> {
+async fn check_webhook_reachable(client: &Client, url: &str) -> Result<String> {
     let response = client.head(url).send().await;
     match response {
-        Ok(resp) if resp.status().is_success() => Ok("reachable"),
+        Ok(resp) if resp.status().is_success() => Ok("reachable".into()),
+        Ok(resp)
+            if resp.status() == StatusCode::UNAUTHORIZED
+                || resp.status() == StatusCode::FORBIDDEN =>
+        {
+            Ok("reachable (auth required)".into())
+        }
         Ok(resp)
             if resp.status() == StatusCode::METHOD_NOT_ALLOWED
                 || resp.status() == StatusCode::NOT_IMPLEMENTED =>
         {
-            let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            if resp.status().is_success() {
-                Ok("reachable (OPTIONS)")
+            let options = client.request(reqwest::Method::OPTIONS, url).send().await?;
+            if options.status().is_success() {
+                Ok("reachable (OPTIONS)".into())
+            } else if options.status() == StatusCode::UNAUTHORIZED
+                || options.status() == StatusCode::FORBIDDEN
+            {
+                Ok("reachable (auth required)".into())
             } else {
-                Ok("method not allowed")
+                Ok(format!("HTTP {}", options.status().as_u16()))
             }
         }
-        Ok(_) => Ok("method not allowed"),
-        Err(err) => {
-            if err.is_builder() {
-                return Err(err.into());
-            }
-            Err(err.into())
-        }
+        Ok(resp) => Ok(format!("HTTP {}", resp.status().as_u16())),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1657,6 +1678,7 @@ struct HorizonCheck {
     reachable: bool,
     found: bool,
     message: String,
+    passphrase_ok: bool,
 }
 
 async fn check_horizon_contract(
@@ -1665,22 +1687,24 @@ async fn check_horizon_contract(
 ) -> HorizonCheck {
     let base = poll_base_url(contract);
     let root = client.get(base).send().await;
-    let (reachable, latest_ledger) = match root {
+    let (reachable, latest_ledger, horizon_passphrase) = match root {
         Ok(response) if response.status().is_success() => {
             let json = response
                 .json::<serde_json::Value>()
                 .await
                 .unwrap_or_default();
-            (
-                true,
-                json.get("core_latest_ledger").and_then(|value| {
-                    value
-                        .as_u64()
-                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                }),
-            )
+            let ledger = json.get("core_latest_ledger").and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            });
+            let passphrase = json
+                .get("network_passphrase")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            (true, ledger, passphrase)
         }
-        _ => (false, None),
+        _ => (false, None, None),
     };
     if !reachable {
         return HorizonCheck {
@@ -1690,8 +1714,33 @@ async fn check_horizon_contract(
             reachable: false,
             found: false,
             message: format!("Horizon {} is unreachable", base),
+            passphrase_ok: true,
         };
     }
+
+    // #225: verify network_passphrase reported by Horizon matches what we expect.
+    let passphrase_ok = match (contract.network.expected_passphrase(), horizon_passphrase.as_deref()) {
+        (Some(expected), Some(actual)) => {
+            if expected != actual {
+                return HorizonCheck {
+                    network: contract.network.as_str().into(),
+                    status: "passphrase mismatch",
+                    latest_ledger,
+                    reachable: true,
+                    found: false,
+                    message: format!(
+                        "network_passphrase mismatch: expected {:?}, got {:?}",
+                        expected, actual
+                    ),
+                    passphrase_ok: false,
+                };
+            }
+            true
+        }
+        // No expected passphrase (custom network without passphrase field) — skip the check.
+        _ => true,
+    };
+
     // Horizon exposes Soroban contract activity through the same account-style
     // transactions collection used by the poller. A 404 means the contract is
     // not known on this network; a successful empty collection is still valid.
@@ -1715,6 +1764,7 @@ async fn check_horizon_contract(
         } else {
             format!("{} not found on {}", contract.contract_id, contract.network)
         },
+        passphrase_ok,
     }
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
